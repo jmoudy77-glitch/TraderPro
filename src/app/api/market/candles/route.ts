@@ -1,9 +1,57 @@
 import { NextResponse } from "next/server";
 import { generateStubCandles } from "@/lib/market-data/stub";
 import { fetchTwelveDataTimeSeries } from "@/lib/market-data/twelvedata";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 type Candle = { time: number; open: number; high: number; low: number; close: number };
+
+type DurableResolution = "1h" | "4h" | "1d";
+
+function durableTableForResolution(resolution: string): "candles_1h" | "candles_4h" | "candles_daily" | null {
+  switch (resolution) {
+    case "1h":
+      return "candles_1h";
+    case "4h":
+      return "candles_4h";
+    case "1d":
+      return "candles_daily";
+    default:
+      return null;
+  }
+}
+
+function toIsoFromEpochSeconds(sec: number): string {
+  return new Date(sec * 1000).toISOString();
+}
+
+async function persistDurableCandles(args: {
+  supabase: SupabaseClient;
+  symbol: string;
+  resolution: string;
+  candles: Array<Candle & { volume?: number }>;
+  source: string;
+  ownerUserId?: string | null;
+}) {
+  const table = durableTableForResolution(args.resolution);
+  if (!table) return;
+
+  const rows = (args.candles ?? []).map((c) => ({
+    owner_user_id: args.ownerUserId ?? null,
+    symbol: args.symbol,
+    ts: toIsoFromEpochSeconds(c.time),
+    o: c.open,
+    h: c.high,
+    l: c.low,
+    c: c.close,
+    v: typeof (c as any).volume === "number" ? (c as any).volume : null,
+    source: args.source,
+  }));
+
+  if (rows.length === 0) return;
+
+  const { error } = await args.supabase.from(table).upsert(rows, { onConflict: "symbol,ts" });
+  if (error) throw error;
+}
 
 // --- NY session helpers for previous regular-session close ---
 const NY_TZ = "America/New_York";
@@ -320,6 +368,27 @@ export async function GET(req: Request) {
             outputsizeExtraLookback: 220,
           });
           seriesBySymbol = map as any;
+          // Persist only durable resolutions (1h/4h/1d). Never persist intraday (30m/5m/1m/15m).
+          const persistTable = durableTableForResolution(resolution);
+          if (persistTable) {
+            void Promise.allSettled(
+              symbols.map(async (sym) => {
+                const series = (seriesBySymbol[sym] ?? []) as any;
+                try {
+                  await persistDurableCandles({
+                    supabase,
+                    symbol: sym,
+                    resolution,
+                    candles: series,
+                    source: "twelvedata",
+                    ownerUserId: ownerUserId ?? null,
+                  });
+                } catch (e) {
+                  console.error(`[candles][persist][watchlist] ${sym} ${resolution} failed`, e);
+                }
+              })
+            );
+          }
         } catch (err: any) {
           const message = err?.message ?? String(err);
           // Trip breaker on provider hard limits / rate limits to prevent repeated burn.
@@ -531,6 +600,17 @@ export async function GET(req: Request) {
           });
 
           const candles = (map[requestSymbol] ?? []) as any;
+          try {
+            await persistDurableCandles({
+              supabase,
+              symbol: requestSymbol,
+              resolution,
+              candles,
+              source: "twelvedata",
+            });
+          } catch (e) {
+            console.error(`[candles][persist][symbol] ${requestSymbol} ${resolution} failed`, e);
+          }
 
           const payload = {
             target: symbol ? `${target}:${symbol}` : target,
