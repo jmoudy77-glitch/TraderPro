@@ -19,10 +19,18 @@
 
 # production
 /build
+/dist
+/.turbo
+/.swc
+/.cache
+/.pnpm-store
 
 # misc
 .DS_Store
 *.pem
+.idea
+.vscode
+*.log
 
 # debug
 npm-debug.log*
@@ -30,11 +38,16 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files (never commit secrets)
 .env*
+!.env.example
+!.env.template
 
 # vercel
 .vercel
+# supabase
+supabase/.temp
+supabase/.branches
 
 # typescript
 *.tsbuildinfo
