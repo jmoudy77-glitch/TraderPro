@@ -249,24 +249,21 @@ export async function GET(req: Request) {
   // Query existing classification rows
   const { data: rows, error: readErr } = await supabase
     .from("symbol_classification")
-    .select("symbol, sector, sector_code, expires_at")
+    .select("symbol, sector, industry, updated_at")
     .in("symbol", allSymbols);
 
   if (readErr) {
     return NextResponse.json({ ok: false, error: readErr.message }, { status: 500 });
   }
 
-  const now = Date.now();
-
   const rowBySymbol = new Map<string, any>();
   for (const r of rows ?? []) {
     rowBySymbol.set(normalizeSymbol(r.symbol), r);
   }
 
-  // Sector miss semantics (authoritative per user + Note):
+  // Phase 2 miss semantics:
   // - no row exists, OR
-  // - sector/sector_code is null/empty, OR
-  // - expires_at < now
+  // - sector is null/empty
   const misses: string[] = [];
   for (const s of allSymbols) {
     const r = rowBySymbol.get(s);
@@ -276,12 +273,7 @@ export async function GET(req: Request) {
     }
 
     const sector = (r.sector ?? "").toString().trim();
-    const sectorCode = (r.sector_code ?? "").toString().trim();
-
-    const exp = r.expires_at ? new Date(r.expires_at).getTime() : 0;
-    const isExpired = !exp || exp < now;
-
-    if (!sector || !sectorCode || isExpired) misses.push(s);
+    if (!sector) misses.push(s);
   }
 
   const selected = misses.slice(0, maxPerTick);
@@ -321,24 +313,14 @@ export async function GET(req: Request) {
       // If sector missing, do NOT write partials (schema invariants)
       if (!sector) continue;
 
-      const sector_code = deriveSectorCode(sector);
-      const expires_at = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000).toISOString();
-
-      const industryNorm = industryRaw ? normalizeIndustry(industryRaw) : "";
-      const industry_code = industryNorm ? deriveIndustryCode(industryNorm) : null;
-      const industry_abbrev = industry_code ? deriveIndustryAbbrev(industry_code) : null;
-
       const { error: upsertErr } = await supabase
         .from("symbol_classification")
         .upsert(
           {
             symbol: normalizeSymbol(symbol),
             sector,
-            sector_code,
             industry: industryRaw || null,
-            industry_code,
-            industry_abbrev,
-            expires_at,
+            updated_at: new Date().toISOString(),
           },
           { onConflict: "symbol" }
         );
