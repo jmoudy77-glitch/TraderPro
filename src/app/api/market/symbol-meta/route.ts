@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 function isExpired(expiresAt: string | null): boolean {
   if (!expiresAt) return true;
@@ -25,7 +25,7 @@ function computeSectorCode(sector: string | null): string | null {
     .toUpperCase();
 }
 
-function getAdmin() {
+function getAdmin(): SupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -71,39 +71,17 @@ export async function GET(req: Request) {
 
   const supabase = getAdmin();
 
-  // Prefer the view if present; fall back to direct join if not.
-  const { data: viewData, error: viewError } = await supabase
-    .from("v_symbol_sector")
-    .select("symbol, sector, sector_code, industry, industry_code, industry_abbrev, expires_at")
+  // DB-only lookup (Phase 2 schema). No upstream calls here.
+  const { data: scData, error: scError } = await supabase
+    .from("symbol_classification")
+    .select("symbol, sector, industry, updated_at")
     .in("symbol", symbols);
 
-  const viewRows = viewData ?? [];
-  const viewSymbols = new Set(
-    viewRows.map((r: any) => String(r?.symbol ?? "").trim().toUpperCase()).filter(Boolean)
-  );
-
-  // If the view exists but is incomplete (returns 0 or misses some symbols), backfill those
-  // symbols directly from symbol_classification.
-  const missingFromView = symbols.filter((s) => !viewSymbols.has(s));
-
-  let scRows: any[] = [];
-  if (viewError || missingFromView.length > 0) {
-    const target = viewError ? symbols : missingFromView;
-
-    const { data: scData, error: scError } = await supabase
-      .from("symbol_classification")
-      .select("symbol, sector, sector_code, industry, industry_code, industry_abbrev, expires_at")
-      .in("symbol", target);
-
-    if (scError) {
-      throw new Error(scError.message);
-    }
-
-    scRows = scData ?? [];
+  if (scError) {
+    throw new Error(scError.message);
   }
 
-  // Merge: view rows first, then symbol_classification rows overlay to ensure completeness.
-  const rows: any[] = [...viewRows, ...scRows];
+  const rows: any[] = scData ?? [];
 
   const meta: Record<
     string,
@@ -136,18 +114,18 @@ export async function GET(req: Request) {
 
     meta[symbol] = {
       sector: r.sector ?? null,
-      sectorCode: r.sector_code ?? null,
+      sectorCode: computeSectorCode(r.sector ?? null),
       industry: r.industry ?? null,
-      industryCode: r.industry_code ?? null,
-      industryAbbrev: r.industry_abbrev ?? null,
-      expiresAt: r.expires_at ? String(r.expires_at) : null,
+      industryCode: null,
+      industryAbbrev: null,
+      expiresAt: null,
     };
   }
 
   // expose hydrate needs for the scheduler (no upstream calls here)
   const needsHydrate = symbols.filter((sym) => {
     const m = meta[sym];
-    return !m?.sector || isExpired(m?.expiresAt ?? null);
+    return !m?.sector;
   });
 
   return NextResponse.json({
