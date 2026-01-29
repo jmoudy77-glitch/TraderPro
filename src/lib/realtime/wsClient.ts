@@ -6,6 +6,10 @@ export type ProviderStatus = {
   lastEventAt: string | null;
   lastError: string | null;
   isStale: boolean;
+
+  reconnectAttempt?: number;
+  nextRetryAt?: number | null;
+  lastDisconnectAt?: number | null;
 };
 
 export type SymbolStatusPayload = {
