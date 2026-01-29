@@ -52,3 +52,5 @@ supabase/.branches
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+node_modules/
+realtime-ws/package-lock.json

@@ -92,6 +92,7 @@ wss.on("connection", (ws) => {
   safeSend(ws, { type: "provider_status", provider_status: providerStatus });
 
   ws.on("message", (raw) => {
+    console.log("[alpaca raw]", raw.toString());
     let msg;
     try {
       msg = JSON.parse(String(raw));
