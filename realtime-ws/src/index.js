@@ -17,6 +17,34 @@ const lastSeenAtBySymbol = new Map();
 /** @type {Map<import("ws").WebSocket, Set<string>>} */
 const subsByClient = new Map();
 
+/** @type {Set<string>} */
+const currentUpstreamSymbols = new Set();
+let upstreamApplyTimer = null;
+
+// Assigned once Alpaca ws exists and we're authorized.
+let applyUpstreamSubscription = null;
+
+function hashSymbols(symbols) {
+  const s = Array.from(symbols).sort().join(",");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
+
+function computeDesiredUpstreamSymbols() {
+  const out = new Set();
+
+  // Seed from env stays in the union.
+  for (const s of parseSymbols(process.env.ALPACA_SYMBOLS ?? "")) out.add(s);
+
+  // Union of all client subscriptions.
+  for (const subs of subsByClient.values()) {
+    for (const s of subs) out.add(s);
+  }
+
+  return out;
+}
+
 /** @type {{ enabled: boolean, feed: string|null, state: string, since: string, lastEventAt: string|null, lastError: string|null, isStale: boolean, reconnectAttempt: number, nextRetryAt: number|null, lastDisconnectAt: number|null }} */
 const providerStatus = {
   enabled: false,
@@ -34,18 +62,7 @@ const providerStatus = {
 };
 
 function getTrackedSymbols() {
-  const out = new Set();
-
-  // Prefer the static subscribe set if configured (keeps UI stable across client connects).
-  const staticSyms = parseSymbols(process.env.ALPACA_SYMBOLS ?? "");
-  for (const s of staticSyms) out.add(s);
-
-  // Also include any client subscriptions (useful if clients request symbols not in the env list).
-  for (const subs of subsByClient.values()) {
-    for (const s of subs) out.add(s);
-  }
-
-  return out;
+  return computeDesiredUpstreamSymbols();
 }
 
 function computeSymbolFreshness(nowMs) {
@@ -197,6 +214,7 @@ wss.on("connection", (ws) => {
 
       safeSend(ws, { type: "subscribed", symbols: Array.from(set) });
       broadcastSymbolStatus();
+      scheduleUpstreamApply("client_change");
       return;
     }
 
@@ -212,6 +230,7 @@ wss.on("connection", (ws) => {
 
       safeSend(ws, { type: "subscribed", symbols: Array.from(set) });
       broadcastSymbolStatus();
+      scheduleUpstreamApply("client_change");
       return;
     }
 
@@ -236,6 +255,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     subsByClient.delete(ws);
     broadcastSymbolStatus();
+    scheduleUpstreamApply("client_change");
   });
 });
 
@@ -267,6 +287,11 @@ const ALPACA_SUB_BARS = process.env.ALPACA_SUB_BARS === "1";
 const ALPACA_RECONNECT_MIN_MS = Number(process.env.ALPACA_RECONNECT_MIN_MS ?? "1000");
 const ALPACA_RECONNECT_MAX_MS = Number(process.env.ALPACA_RECONNECT_MAX_MS ?? "10000");
 const SIMULATE_PROVIDER_DOWN = process.env.SIMULATE_PROVIDER_DOWN === "1";
+
+// Phase 4C-2: REST backfill / reconciliation (gap repair)
+const ALPACA_REST_BASE_URL = process.env.ALPACA_REST_BASE_URL ?? "https://data.alpaca.markets";
+const ALPACA_BACKFILL_MAX_MS = Number(process.env.ALPACA_BACKFILL_MAX_MS ?? "10000");
+const ALPACA_BACKFILL_MAX_TRADES = Math.max(1, Number(process.env.ALPACA_BACKFILL_MAX_TRADES ?? "500"));
 
 function parseSymbols(raw) {
   return raw
@@ -322,7 +347,189 @@ function normalizeAlpacaEvent(ev) {
   return null;
 }
 
-function broadcastMarketEvent(canonical) {
+function isoFromMs(ms) {
+  return new Date(ms).toISOString();
+}
+
+function mapRestTradeToCanonical(symbol, t) {
+  const sym = String(symbol ?? "").trim().toUpperCase();
+  if (!sym) return null;
+  // Alpaca REST trades typically return { t, p, s, ... }
+  return {
+    type: "trade",
+    symbol: sym,
+    ts: t?.t ?? null,
+    price: t?.p ?? null,
+    size: t?.s ?? null,
+    source: "alpaca",
+  };
+}
+
+async function fetchBackfillTrades(symbol, startMs, endMs) {
+  const sym = String(symbol).trim().toUpperCase();
+  if (!sym) return { trades: [], error: "bad_symbol" };
+
+  const startIso = isoFromMs(startMs);
+  const endIso = isoFromMs(endMs);
+
+  const url = new URL(`${ALPACA_REST_BASE_URL}/v2/stocks/${encodeURIComponent(sym)}/trades`);
+  url.searchParams.set("start", startIso);
+  url.searchParams.set("end", endIso);
+  url.searchParams.set("limit", String(ALPACA_BACKFILL_MAX_TRADES));
+  url.searchParams.set("sort", "asc");
+
+  // Use the same feed inference as WS when available (sip/iex/delayed_sip)
+  if (providerStatus.feed) url.searchParams.set("feed", String(providerStatus.feed));
+
+  try {
+    const resp = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+      },
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      return { trades: [], error: `http_${resp.status}${text ? ":" + text.slice(0, 160) : ""}` };
+    }
+
+    const data = await resp.json();
+    const trades = Array.isArray(data?.trades) ? data.trades : [];
+    return { trades, error: null };
+  } catch (e) {
+    return { trades: [], error: String(e?.message ?? e ?? "fetch_error") };
+  }
+}
+
+let backfillRunId = 0;
+async function runReconnectBackfill({ disconnectAtMs, reconnectedAtMs }) {
+  const runId = ++backfillRunId;
+
+  const desired = computeDesiredUpstreamSymbols();
+  if (desired.size === 0) {
+    console.log("[alpaca] backfill_summary", {
+      runId,
+      skipped: true,
+      skipped_reason: "empty_union",
+      disconnectAtMs,
+      reconnectedAtMs,
+    });
+    return;
+  }
+
+  const windowEnd = reconnectedAtMs;
+  const maxWindowMs = Math.max(0, ALPACA_BACKFILL_MAX_MS);
+
+  let totalFetched = 0;
+  let totalEmitted = 0;
+  let totalSkipped = 0;
+
+  for (const sym of desired) {
+    const lastSeen = lastSeenAtBySymbol.get(sym) ?? 0;
+    const fromMs = Math.max(lastSeen, disconnectAtMs ?? 0);
+    const toMs = windowEnd;
+
+    if (!fromMs || toMs - fromMs <= 0) {
+      totalSkipped += 1;
+      console.log("[alpaca] backfill_symbol", {
+        runId,
+        symbol: sym,
+        gap_from: fromMs ? isoFromMs(fromMs) : null,
+        gap_to: isoFromMs(toMs),
+        rest_count: 0,
+        emitted_count: 0,
+        skipped_reason: "no_gap",
+      });
+      continue;
+    }
+
+    const clampedFromMs = Math.max(toMs - maxWindowMs, fromMs);
+    if (toMs - clampedFromMs <= 0) {
+      totalSkipped += 1;
+      console.log("[alpaca] backfill_symbol", {
+        runId,
+        symbol: sym,
+        gap_from: isoFromMs(fromMs),
+        gap_to: isoFromMs(toMs),
+        rest_count: 0,
+        emitted_count: 0,
+        skipped_reason: "clamped_empty",
+      });
+      continue;
+    }
+
+    const { trades, error } = await fetchBackfillTrades(sym, clampedFromMs, toMs);
+    const restCount = trades.length;
+    totalFetched += restCount;
+
+    if (error) {
+      totalSkipped += 1;
+      console.log("[alpaca] backfill_symbol", {
+        runId,
+        symbol: sym,
+        gap_from: isoFromMs(clampedFromMs),
+        gap_to: isoFromMs(toMs),
+        rest_count: restCount,
+        emitted_count: 0,
+        skipped_reason: error,
+      });
+      continue;
+    }
+
+    let emitted = 0;
+    const meta = {
+      backfill: true,
+      windowFrom: isoFromMs(clampedFromMs),
+      windowTo: isoFromMs(toMs),
+      runId,
+    };
+
+    for (const t of trades) {
+      const canonical = mapRestTradeToCanonical(sym, t);
+      if (!canonical) continue;
+      broadcastMarketEvent(canonical, meta);
+      emitted += 1;
+    }
+
+    totalEmitted += emitted;
+
+    console.log("[alpaca] backfill_symbol", {
+      runId,
+      symbol: sym,
+      gap_from: isoFromMs(clampedFromMs),
+      gap_to: isoFromMs(toMs),
+      rest_count: restCount,
+      emitted_count: emitted,
+      skipped_reason: null,
+    });
+  }
+
+  console.log("[alpaca] backfill_summary", {
+    runId,
+    disconnectAtMs,
+    reconnectedAtMs,
+    desiredCount: desired.size,
+    totalFetched,
+    totalEmitted,
+    totalSkipped,
+    maxWindowMs: maxWindowMs,
+    maxTradesPerSymbol: ALPACA_BACKFILL_MAX_TRADES,
+  });
+}
+
+function scheduleUpstreamApply(reason) {
+  if (upstreamApplyTimer) clearTimeout(upstreamApplyTimer);
+  upstreamApplyTimer = setTimeout(() => {
+    upstreamApplyTimer = null;
+    if (typeof applyUpstreamSubscription === "function") {
+      applyUpstreamSubscription(reason);
+    }
+  }, 350);
+}
+
+function broadcastMarketEvent(canonical, meta = null) {
   if (providerStatus.state !== "subscribed") return;
 
   providerStatus.lastEventAt = new Date().toISOString();
@@ -331,7 +538,9 @@ function broadcastMarketEvent(canonical) {
 
   for (const [client, subs] of subsByClient.entries()) {
     if (!subs.has(canonical.symbol)) continue;
-    safeSend(client, { type: "md", event: canonical, provider_status: providerStatus });
+    const payload = { type: "md", event: canonical, provider_status: providerStatus };
+    if (meta) payload.meta = meta;
+    safeSend(client, payload);
   }
 }
 
@@ -348,13 +557,6 @@ async function startAlpaca() {
     return;
   }
 
-  const symbols = parseSymbols(ALPACA_SYMBOLS_RAW);
-  if (!symbols.length) {
-    console.error("[alpaca] ALPACA_SYMBOLS is empty; refusing to connect without a static subscribe set.");
-    setProviderState("error", { lastError: "missing_symbols" });
-    return;
-  }
-
   if (SIMULATE_PROVIDER_DOWN) {
     console.warn("[alpaca] SIMULATE_PROVIDER_DOWN=1; forcing reconnect loop without upstream connection");
 
@@ -368,6 +570,9 @@ async function startAlpaca() {
       // Phase 4B truth: reflect attempt immediately on each reconnect
       providerStatus.reconnectAttempt = attempt;
       providerStatus.nextRetryAt = null;
+
+      currentUpstreamSymbols.clear();
+      applyUpstreamSubscription = null;
 
       // Simulated: never reach connected/authorized/subscribed
       setProviderState("reconnecting", { lastError: "simulated_down" });
@@ -416,13 +621,21 @@ async function startAlpaca() {
       if (subscribed) return;
       subscribed = true;
 
+      const reconnectDisconnectAtMs = providerStatus.lastDisconnectAt;
+
       // Phase 4B truth: reset reconnect bookkeeping on successful subscription
       attempt = 0;
       providerStatus.reconnectAttempt = 0;
       providerStatus.nextRetryAt = null;
       providerStatus.lastDisconnectAt = null;
 
+      const reconnectedAtMs = Date.now();
       setProviderState("subscribed");
+
+      // Phase 4C-2: gap repair via REST trades when we are recovering from a disconnect.
+      if (reconnectDisconnectAtMs != null) {
+        void runReconnectBackfill({ disconnectAtMs: reconnectDisconnectAtMs, reconnectedAtMs });
+      }
     };
 
     const scheduleReconnect = (why) => {
@@ -430,9 +643,15 @@ async function startAlpaca() {
 
       const nowMs = Date.now();
       providerStatus.lastDisconnectAt = nowMs;
+      currentUpstreamSymbols.clear();
+      applyUpstreamSubscription = null;
 
       // Existing backoff policy (min/max + exponential) — compute the actual scheduled delay.
-      const backoff = clamp(ALPACA_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4), ALPACA_RECONNECT_MIN_MS, ALPACA_RECONNECT_MAX_MS);
+      const backoff = clamp(
+        ALPACA_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4),
+        ALPACA_RECONNECT_MIN_MS,
+        ALPACA_RECONNECT_MAX_MS
+      );
       const delayMs = jitter(backoff);
 
       providerStatus.nextRetryAt = nowMs + delayMs;
@@ -462,11 +681,62 @@ async function startAlpaca() {
             authed = true;
             setProviderState("authorized");
 
-            const sub = { action: "subscribe" };
-            if (ALPACA_SUB_TRADES) sub.trades = symbols;
-            if (ALPACA_SUB_QUOTES) sub.quotes = symbols;
-            if (ALPACA_SUB_BARS) sub.bars = symbols;
-            ws.send(JSON.stringify(sub));
+            // Enable debounced upstream updates as soon as we're authorized.
+            applyUpstreamSubscription = (reason) => {
+              const next = computeDesiredUpstreamSymbols();
+
+              // Dynamic-only allowed: if union is empty, do not subscribe.
+              if (next.size === 0) {
+                currentUpstreamSymbols.clear();
+                console.log("[alpaca] upstream_sub_update", {
+                  reason: reason ?? "client_change",
+                  attempt,
+                  desiredCount: 0,
+                  desiredHash: hashSymbols(next),
+                  sample: [],
+                });
+                return;
+              }
+
+              let changed = false;
+              if (next.size !== currentUpstreamSymbols.size) {
+                changed = true;
+              } else {
+                for (const s of next) {
+                  if (!currentUpstreamSymbols.has(s)) {
+                    changed = true;
+                    break;
+                  }
+                }
+              }
+              if (!changed) return;
+
+              const arr = Array.from(next);
+              const msg = { action: "subscribe" };
+              if (ALPACA_SUB_TRADES) msg.trades = arr;
+              if (ALPACA_SUB_QUOTES) msg.quotes = arr;
+              if (ALPACA_SUB_BARS) msg.bars = arr;
+
+              try {
+                ws.send(JSON.stringify(msg));
+              } catch {
+                return;
+              }
+
+              currentUpstreamSymbols.clear();
+              for (const s of next) currentUpstreamSymbols.add(s);
+
+              console.log("[alpaca] upstream_sub_update", {
+                reason: reason ?? "client_change",
+                attempt,
+                desiredCount: next.size,
+                desiredHash: hashSymbols(next),
+                sample: arr.slice(0, 5),
+              });
+            };
+
+            // Apply immediately on connect/reconnect (may be empty; that's allowed).
+            applyUpstreamSubscription(attempt === 1 ? "connect" : "reconnect");
             continue;
           }
         }
