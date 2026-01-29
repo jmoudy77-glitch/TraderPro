@@ -2,7 +2,7 @@
   "name": "@traderpro/realtime-ws",
   "private": true,
   "version": "0.1.0",
-  "type": "commonjs",
+  "type": "module",
   "main": "dist/index.cjs",
   "scripts": {
     "dev": "node src/index.js",
