@@ -712,6 +712,39 @@ function broadcastMarketEvent(canonical, meta = null) {
   lastSeenAtBySymbol.set(canonical.symbol, Date.now()); // arrival-time freshness
   latestBySymbol.set(canonical.symbol, { ts: providerStatus.lastEventAt, event: canonical });
 
+  // --- Phase 5-4: candle builder (trade-first) ---
+  if (canonical.type === "trade" && typeof canonical.ts === "number" && typeof canonical.price === "number") {
+    const eventTsMs = canonical.ts;
+    const price = canonical.price;
+    const size = Number(canonical.size ?? 0);
+
+    for (const resKey of RES_MINUTES.keys()) {
+      const store = getOrInitCandleStore(resKey, canonical.symbol);
+      const bucketTsMs = bucketStartTsMs(eventTsMs, resKey);
+
+      let candle = store.candles.length > 0 ? store.candles[store.candles.length - 1] : null;
+
+      if (!candle || candle.ts !== bucketTsMs) {
+        candle = {
+          ts: bucketTsMs,
+          o: price,
+          h: price,
+          l: price,
+          c: price,
+          v: size,
+        };
+        store.candles.push(candle);
+      } else {
+        candle.h = Math.max(candle.h, price);
+        candle.l = Math.min(candle.l, price);
+        candle.c = price;
+        candle.v += size;
+      }
+
+      store.lastUpdateTsMs = Date.now();
+    }
+  }
+
   for (const [client, subs] of subsByClient.entries()) {
     if (!subs.has(canonical.symbol)) continue;
     const payload = { type: "md", event: canonical, provider_status: providerStatus };
