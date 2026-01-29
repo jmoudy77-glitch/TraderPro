@@ -53,7 +53,44 @@ export default function RealtimeTestPage() {
     };
   }, [symbols.join(",")]);
 
-  const nowMs = Date.now();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const gate = useMemo(() => {
+    const ps = provider;
+    const ss = symbolStatus;
+
+    const providerRed = !ps || ps.isStale === true || ps.state !== "subscribed";
+    const retryInSec = ps?.nextRetryAt ? Math.max(0, Math.floor((ps.nextRetryAt - nowMs) / 1000)) : null;
+
+    let anySymbolStale = false;
+    if (ss) {
+      for (const sym of symbols) {
+        if (ss.isStaleBySymbol[sym] ?? true) {
+          anySymbolStale = true;
+          break;
+        }
+      }
+    }
+
+    const level: "green" | "yellow" | "red" = providerRed ? "red" : anySymbolStale ? "yellow" : "green";
+
+    let message = "Live feed healthy.";
+    if (level === "red") {
+      message = "DATA INVALID — provider not subscribed or stale.";
+      if (ps?.state && ps.state !== "subscribed") message += ` (state: ${ps.state})`;
+      if (ps?.lastError) message += ` (error: ${ps.lastError})`;
+      if (retryInSec != null) message += ` (retry in ${retryInSec}s)`;
+    } else if (level === "yellow") {
+      message = "PARTIAL STALENESS — some symbols are stale.";
+    }
+
+    return { level, message, retryInSec };
+  }, [provider, symbolStatus, symbols.join(","), nowMs]);
 
   return (
     <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
@@ -63,6 +100,13 @@ export default function RealtimeTestPage() {
         <div><strong>WS:</strong> {WS_URL}</div>
         <div><strong>Symbols:</strong> {symbols.join(", ")}</div>
         <div><strong>Connected:</strong> {connected ? "yes" : "no"}</div>
+
+        <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}>
+          <div style={{ fontWeight: 800, marginBottom: 4 }}>
+            Gate: {gate.level.toUpperCase()}
+          </div>
+          <div>{gate.message}</div>
+        </div>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12, maxWidth: 900 }}>
@@ -77,6 +121,9 @@ export default function RealtimeTestPage() {
               <div><strong>lastEventAt:</strong> {provider.lastEventAt ?? "—"}</div>
               <div><strong>lastError:</strong> {provider.lastError ?? "—"}</div>
               <div><strong>isStale:</strong> {String(provider.isStale)}</div>
+              <div><strong>reconnectAttempt:</strong> {provider.reconnectAttempt ?? "—"}</div>
+              <div><strong>nextRetryAt:</strong> {provider.nextRetryAt ? new Date(provider.nextRetryAt).toISOString() : "—"}</div>
+              <div><strong>lastDisconnectAt:</strong> {provider.lastDisconnectAt ? new Date(provider.lastDisconnectAt).toISOString() : "—"}</div>
             </div>
           )}
         </section>
