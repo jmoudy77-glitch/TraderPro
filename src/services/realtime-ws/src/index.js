@@ -1,7 +1,7 @@
 import http from "node:http";
 import { WebSocketServer } from "ws";
 
-const PORT = Number(process.env.PORT || "8080");
+const PORT = Number(process.env.PORT) || 8080;
 const HOST = "0.0.0.0";
 
 // --- In-memory WS truth (v1) ---
@@ -182,4 +182,8 @@ async function startAlpaca() {
 server.listen(PORT, HOST, async () => {
   console.log(`[realtime-ws] listening on ${HOST}:${PORT}`);
   await startAlpaca();
+});
+
+server.on("error", (err) => {
+  console.error("[realtime-ws] server error", err);
 });
