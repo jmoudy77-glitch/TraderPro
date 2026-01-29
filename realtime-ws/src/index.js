@@ -1,3 +1,5 @@
+console.log("REALTIME-WS ENTRYPOINT REACHED");
+
 import http from "node:http";
 import { WebSocketServer } from "ws";
 

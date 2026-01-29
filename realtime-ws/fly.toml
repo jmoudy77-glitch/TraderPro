@@ -1,0 +1,25 @@
+app = "traderpro-realtime-ws"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[[services]]
+protocol = "tcp"
+internal_port = 8080
+
+[[services.ports]]
+port = 443
+handlers = ["tls"]
+
+[[services.ports]]
+port = 80
+handlers = ["http"]
+
+[services.concurrency]
+type = "connections"
+hard_limit = 1000
+soft_limit = 800
