@@ -260,6 +260,7 @@ const ALPACA_SUB_QUOTES = process.env.ALPACA_SUB_QUOTES !== "0";
 const ALPACA_SUB_BARS = process.env.ALPACA_SUB_BARS === "1";
 const ALPACA_RECONNECT_MIN_MS = Number(process.env.ALPACA_RECONNECT_MIN_MS ?? "1000");
 const ALPACA_RECONNECT_MAX_MS = Number(process.env.ALPACA_RECONNECT_MAX_MS ?? "10000");
+const SIMULATE_PROVIDER_DOWN = process.env.SIMULATE_PROVIDER_DOWN === "1";
 
 function parseSymbols(raw) {
   return raw
@@ -345,6 +346,43 @@ async function startAlpaca() {
   if (!symbols.length) {
     console.error("[alpaca] ALPACA_SYMBOLS is empty; refusing to connect without a static subscribe set.");
     setProviderState("error", { lastError: "missing_symbols" });
+    return;
+  }
+
+  if (SIMULATE_PROVIDER_DOWN) {
+    console.warn("[alpaca] SIMULATE_PROVIDER_DOWN=1; forcing reconnect loop without upstream connection");
+
+    let attempt = 0;
+    let stopped = false;
+
+    const connectOnceSimulated = () => {
+      if (stopped) return;
+      attempt += 1;
+
+      // Phase 4B truth: reflect attempt immediately on each reconnect
+      providerStatus.reconnectAttempt = attempt;
+      providerStatus.nextRetryAt = null;
+
+      // Simulated: never reach connected/authorized/subscribed
+      setProviderState("reconnecting", { lastError: "simulated_down" });
+
+      const nowMs = Date.now();
+      providerStatus.lastDisconnectAt = nowMs;
+
+      const backoff = clamp(
+        ALPACA_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4),
+        ALPACA_RECONNECT_MIN_MS,
+        ALPACA_RECONNECT_MAX_MS
+      );
+      const delayMs = jitter(backoff);
+
+      providerStatus.nextRetryAt = nowMs + delayMs;
+      broadcastProviderStatus();
+
+      setTimeout(connectOnceSimulated, delayMs);
+    };
+
+    connectOnceSimulated();
     return;
   }
 
