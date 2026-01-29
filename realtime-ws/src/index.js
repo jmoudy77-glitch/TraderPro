@@ -6,12 +6,18 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = "0.0.0.0";
 
+const STALE_AFTER_MS = Number(process.env.STALE_AFTER_MS ?? 15000);
+// Keep this small but never absurdly tight (protects CPU + avoids spam on reconnect loops).
+const SYMBOL_STATUS_BROADCAST_MS = Math.max(250, Number(process.env.SYMBOL_STATUS_BROADCAST_MS ?? 1000));
+
 /** @type {Map<string, any>} */
 const latestBySymbol = new Map();
+/** @type {Map<string, number>} */
+const lastSeenAtBySymbol = new Map();
 /** @type {Map<import("ws").WebSocket, Set<string>>} */
 const subsByClient = new Map();
 
-/** @type {{ enabled: boolean, feed: string|null, state: string, since: string, lastEventAt: string|null, lastError: string|null }} */
+/** @type {{ enabled: boolean, feed: string|null, state: string, since: string, lastEventAt: string|null, lastError: string|null, isStale: boolean }} */
 const providerStatus = {
   enabled: false,
   feed: null,
@@ -19,7 +25,67 @@ const providerStatus = {
   since: new Date().toISOString(),
   lastEventAt: null,
   lastError: null,
+  isStale: false,
 };
+
+function getTrackedSymbols() {
+  const out = new Set();
+
+  // Prefer the static subscribe set if configured (keeps UI stable across client connects).
+  const staticSyms = parseSymbols(process.env.ALPACA_SYMBOLS ?? "");
+  for (const s of staticSyms) out.add(s);
+
+  // Also include any client subscriptions (useful if clients request symbols not in the env list).
+  for (const subs of subsByClient.values()) {
+    for (const s of subs) out.add(s);
+  }
+
+  return out;
+}
+
+function computeSymbolFreshness(nowMs) {
+  /** @type {Record<string, number|null>} */
+  const lastSeenAtBySymbolObj = {};
+  /** @type {Record<string, boolean>} */
+  const isStaleBySymbolObj = {};
+
+  const tracked = getTrackedSymbols();
+  for (const sym of tracked) {
+    const last = lastSeenAtBySymbol.get(sym) ?? null;
+    lastSeenAtBySymbolObj[sym] = last;
+    isStaleBySymbolObj[sym] = !last || nowMs - last > STALE_AFTER_MS;
+  }
+
+  return { lastSeenAtBySymbolObj, isStaleBySymbolObj, trackedCount: tracked.size };
+}
+
+function updateProviderStaleFlag(nowMs) {
+  const { isStaleBySymbolObj, trackedCount } = computeSymbolFreshness(nowMs);
+  const syms = Object.keys(isStaleBySymbolObj);
+
+  // "Subscribed but not receiving" = stale. If nothing is tracked yet, treat as stale.
+  const allStale = trackedCount === 0 ? true : syms.every((s) => isStaleBySymbolObj[s] === true);
+  providerStatus.isStale = providerStatus.state === "subscribed" ? allStale : false;
+}
+
+function broadcastSymbolStatus() {
+  const nowMs = Date.now();
+  updateProviderStaleFlag(nowMs);
+  const { lastSeenAtBySymbolObj, isStaleBySymbolObj } = computeSymbolFreshness(nowMs);
+
+  const payload = {
+    type: "symbol_status",
+    now: new Date(nowMs).toISOString(),
+    staleAfterMs: STALE_AFTER_MS,
+    lastSeenAtBySymbol: lastSeenAtBySymbolObj,
+    isStaleBySymbol: isStaleBySymbolObj,
+    provider_status: providerStatus,
+  };
+
+  for (const ws of subsByClient.keys()) {
+    safeSend(ws, payload);
+  }
+}
 
 function safeSend(ws, msg) {
   try {
@@ -53,13 +119,25 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
   if (url.pathname === "/health") {
+    const nowMs = Date.now();
+    updateProviderStaleFlag(nowMs);
+    const { lastSeenAtBySymbolObj, isStaleBySymbolObj } = computeSymbolFreshness(nowMs);
+    const tracked = Object.keys(lastSeenAtBySymbolObj);
+    const staleCount = Object.values(isStaleBySymbolObj).filter(Boolean).length;
+
     return json(res, 200, {
       ok: true,
       service: "realtime-ws",
-      now: new Date().toISOString(),
+      now: new Date(nowMs).toISOString(),
       clients: subsByClient.size,
       symbolsTracked: latestBySymbol.size,
       providerStatus,
+      staleAfterMs: STALE_AFTER_MS,
+      symbols: {
+        tracked,
+        staleCount,
+        lastSeenAtBySymbol: lastSeenAtBySymbolObj,
+      },
     });
   }
 
@@ -85,6 +163,7 @@ wss.on("connection", (ws) => {
 
   safeSend(ws, { type: "hello", now: new Date().toISOString() });
   safeSend(ws, { type: "provider_status", provider_status: providerStatus });
+  broadcastSymbolStatus();
 
   ws.on("message", (raw) => {
     let msg;
@@ -106,6 +185,7 @@ wss.on("connection", (ws) => {
       }
 
       safeSend(ws, { type: "subscribed", symbols: Array.from(set) });
+      broadcastSymbolStatus();
       return;
     }
 
@@ -120,8 +200,11 @@ wss.on("connection", (ws) => {
       }
 
       safeSend(ws, { type: "subscribed", symbols: Array.from(set) });
+      broadcastSymbolStatus();
       return;
     }
+
+    broadcastSymbolStatus();
 
     if (msg?.type === "get_latest") {
       const symbols = Array.isArray(msg.symbols) ? msg.symbols : [];
@@ -141,6 +224,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     subsByClient.delete(ws);
+    broadcastSymbolStatus();
   });
 });
 
@@ -230,6 +314,7 @@ function broadcastMarketEvent(canonical) {
   if (providerStatus.state !== "subscribed") return;
 
   providerStatus.lastEventAt = new Date().toISOString();
+  lastSeenAtBySymbol.set(canonical.symbol, Date.now()); // arrival-time freshness
   latestBySymbol.set(canonical.symbol, { ts: providerStatus.lastEventAt, event: canonical });
 
   for (const [client, subs] of subsByClient.entries()) {
@@ -357,6 +442,12 @@ server.listen(PORT, HOST, async () => {
   console.log(`[realtime-ws] listening on ${HOST}:${PORT}`);
   await startAlpaca();
 });
+
+setInterval(() => {
+  // Independent truth surface: freshness/staleness must keep updating even when upstream is quiet/disconnected.
+  if (subsByClient.size === 0) return;
+  broadcastSymbolStatus();
+}, SYMBOL_STATUS_BROADCAST_MS);
 
 server.on("error", (err) => {
   console.error("[realtime-ws] server error", err);
