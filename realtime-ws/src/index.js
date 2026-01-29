@@ -6,14 +6,11 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = "0.0.0.0";
 
-// --- In-memory WS truth (v1) ---
 /** @type {Map<string, any>} */
 const latestBySymbol = new Map();
 /** @type {Map<import("ws").WebSocket, Set<string>>} */
 const subsByClient = new Map();
 
-// --- Provider truth surface (v1) ---
-// Invariant: service truthfully reports upstream state, and never emits md unless subscribed.
 /** @type {{ enabled: boolean, feed: string|null, state: string, since: string, lastEventAt: string|null, lastError: string|null }} */
 const providerStatus = {
   enabled: false,
@@ -71,7 +68,6 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ noServer: true });
 
-// Upgrade only /ws
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   if (url.pathname !== "/ws") {
@@ -84,7 +80,6 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (ws) => {
   subsByClient.set(ws, new Set());
 
-  // ping/pong keepalive
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
 
@@ -92,7 +87,6 @@ wss.on("connection", (ws) => {
   safeSend(ws, { type: "provider_status", provider_status: providerStatus });
 
   ws.on("message", (raw) => {
-    console.log("[alpaca raw]", raw.toString());
     let msg;
     try {
       msg = JSON.parse(String(raw));
@@ -166,13 +160,11 @@ setInterval(() => {
   }
 }, 30_000);
 
-// --- Alpaca ingress (Step 1) ---
-// Invariant: must reach connecting->connected->authorized->subscribed with ALPACA_ENABLED=1
-// and must not emit market data unless subscribed.
+// --- Alpaca ingress ---
 const ALPACA_ENABLED = process.env.ALPACA_ENABLED === "1";
 const ALPACA_KEY = process.env.ALPACA_KEY ?? "";
 const ALPACA_SECRET = process.env.ALPACA_SECRET ?? "";
-const ALPACA_WS_URL = process.env.ALPACA_WS_URL ?? ""; // e.g. wss://stream.data.alpaca.markets/v2/sip
+const ALPACA_WS_URL = process.env.ALPACA_WS_URL ?? ""; // wss://stream.data.alpaca.markets/v2/sip
 const ALPACA_SYMBOLS_RAW = process.env.ALPACA_SYMBOLS ?? "";
 const ALPACA_SUB_TRADES = process.env.ALPACA_SUB_TRADES !== "0";
 const ALPACA_SUB_QUOTES = process.env.ALPACA_SUB_QUOTES !== "0";
@@ -205,29 +197,17 @@ function clamp(n, lo, hi) {
 }
 
 function jitter(ms) {
-  // +/- 20%
-  const r = Math.random() * 0.4 - 0.2;
+  const r = Math.random() * 0.4 - 0.2; // +/- 20%
   return Math.round(ms * (1 + r));
 }
 
 function normalizeAlpacaEvent(ev) {
-  // Alpaca v2 stock stream uses "T" for event type, "S" for symbol.
   const sym = String(ev?.S ?? "").trim().toUpperCase();
   if (!sym) return null;
 
-  // Trade
   if (ev?.T === "t") {
-    return {
-      type: "trade",
-      symbol: sym,
-      ts: ev?.t ?? null,
-      price: ev?.p ?? null,
-      size: ev?.s ?? null,
-      source: "alpaca",
-    };
+    return { type: "trade", symbol: sym, ts: ev?.t ?? null, price: ev?.p ?? null, size: ev?.s ?? null, source: "alpaca" };
   }
-
-  // Quote
   if (ev?.T === "q") {
     return {
       type: "quote",
@@ -240,32 +220,16 @@ function normalizeAlpacaEvent(ev) {
       source: "alpaca",
     };
   }
-
-  // Bar
   if (ev?.T === "b") {
-    return {
-      type: "bar",
-      symbol: sym,
-      ts: ev?.t ?? null,
-      o: ev?.o ?? null,
-      h: ev?.h ?? null,
-      l: ev?.l ?? null,
-      c: ev?.c ?? null,
-      v: ev?.v ?? null,
-      source: "alpaca",
-    };
+    return { type: "bar", symbol: sym, ts: ev?.t ?? null, o: ev?.o ?? null, h: ev?.h ?? null, l: ev?.l ?? null, c: ev?.c ?? null, v: ev?.v ?? null, source: "alpaca" };
   }
-
   return null;
 }
 
 function broadcastMarketEvent(canonical) {
-  // Hard gate: never emit market data unless subscribed
   if (providerStatus.state !== "subscribed") return;
 
   providerStatus.lastEventAt = new Date().toISOString();
-
-  // latest-per-symbol map (truth derived from canonical event)
   latestBySymbol.set(canonical.symbol, { ts: providerStatus.lastEventAt, event: canonical });
 
   for (const [client, subs] of subsByClient.entries()) {
@@ -289,7 +253,7 @@ async function startAlpaca() {
 
   const symbols = parseSymbols(ALPACA_SYMBOLS_RAW);
   if (!symbols.length) {
-    console.error("[alpaca] ALPACA_SYMBOLS is empty; refusing to connect without a static subscribe set (Step 1 invariant).");
+    console.error("[alpaca] ALPACA_SYMBOLS is empty; refusing to connect without a static subscribe set.");
     setProviderState("error", { lastError: "missing_symbols" });
     return;
   }
@@ -313,11 +277,7 @@ async function startAlpaca() {
     const scheduleReconnect = (why) => {
       if (stopped) return;
       setProviderState("reconnecting", { lastError: why ?? "disconnected" });
-      const backoff = clamp(
-        ALPACA_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4),
-        ALPACA_RECONNECT_MIN_MS,
-        ALPACA_RECONNECT_MAX_MS
-      );
+      const backoff = clamp(ALPACA_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4), ALPACA_RECONNECT_MIN_MS, ALPACA_RECONNECT_MAX_MS);
       setTimeout(connectOnce, jitter(backoff));
     };
 
@@ -336,15 +296,12 @@ async function startAlpaca() {
 
       const events = Array.isArray(data) ? data : [data];
       for (const ev of events) {
-        // Control messages
         if (ev?.T === "success") {
           const msg = String(ev?.msg ?? ev?.message ?? "").toLowerCase();
-
           if (!authed && msg.includes("authenticated")) {
             authed = true;
             setProviderState("authorized");
 
-            // Subscribe immediately after auth
             const sub = { action: "subscribe" };
             if (ALPACA_SUB_TRADES) sub.trades = symbols;
             if (ALPACA_SUB_QUOTES) sub.quotes = symbols;
@@ -352,12 +309,15 @@ async function startAlpaca() {
             ws.send(JSON.stringify(sub));
             continue;
           }
+        }
 
-          if (msg.includes("subscribed")) {
+        // SUBSCRIPTION ACK: SIP responds with T:"subscription"
+        if (ev?.T === "subscription") {
+          if (!subscribed) {
             subscribed = true;
             setProviderState("subscribed");
-            continue;
           }
+          continue;
         }
 
         if (ev?.T === "error") {
@@ -370,11 +330,14 @@ async function startAlpaca() {
           continue;
         }
 
-        // Market data events — only process after subscribed (hard gate)
-        if (!subscribed || providerStatus.state !== "subscribed") continue;
-
+        // Market data events: also implies subscribed (belt + suspenders)
         const canonical = normalizeAlpacaEvent(ev);
         if (!canonical) continue;
+
+        if (!subscribed) {
+          subscribed = true;
+          setProviderState("subscribed");
+        }
 
         broadcastMarketEvent(canonical);
       }
