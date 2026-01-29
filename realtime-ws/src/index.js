@@ -65,12 +65,18 @@ function computeSymbolFreshness(nowMs) {
 }
 
 function updateProviderStaleFlag(nowMs) {
+  // Phase 4B gating truth: if we're not subscribed, data is not trustworthy.
+  if (providerStatus.state !== "subscribed") {
+    providerStatus.isStale = true;
+    return;
+  }
+
   const { isStaleBySymbolObj, trackedCount } = computeSymbolFreshness(nowMs);
   const syms = Object.keys(isStaleBySymbolObj);
 
   // "Subscribed but not receiving" = stale. If nothing is tracked yet, treat as stale.
   const allStale = trackedCount === 0 ? true : syms.every((s) => isStaleBySymbolObj[s] === true);
-  providerStatus.isStale = providerStatus.state === "subscribed" ? allStale : false;
+  providerStatus.isStale = allStale;
 }
 
 function broadcastSymbolStatus() {
