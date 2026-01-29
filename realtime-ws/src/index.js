@@ -114,6 +114,42 @@ const lastSeenAtBySymbol = new Map();
 /** @type {Map<import("ws").WebSocket, Set<string>>} */
 const subsByClient = new Map();
 
+// --- Phase 5-3: in-memory intraday candle store (single node) ---
+// Session boundary + trimming is introduced in Phase 5-5; keep explicit nullable fields for now.
+const intradaySession = {
+  /** @type {string|null} */
+  sessionKey: null,
+  /** @type {number|null} */
+  sessionStartTsMs: null,
+};
+
+/**
+ * candlesByResThenSymbol.get(res).get(symbol) -> { candles: [], lastUpdateTsMs }
+ *
+ * @type {Map<string, Map<string, { candles: Array<{ ts: number, o: number, h: number, l: number, c: number, v: number }>, lastUpdateTsMs: number|null }>>}
+ */
+const candlesByResThenSymbol = new Map([
+  ["1m", new Map()],
+  ["5m", new Map()],
+  ["30m", new Map()],
+]);
+
+function getOrInitCandleStore(res, symbol) {
+  const resKey = String(res);
+  const symKey = String(symbol).trim().toUpperCase();
+
+  const bySymbol = candlesByResThenSymbol.get(resKey);
+  if (!bySymbol) throw new Error(`bad_resolution_store:${resKey}`);
+
+  let store = bySymbol.get(symKey);
+  if (!store) {
+    store = { candles: [], lastUpdateTsMs: null };
+    bySymbol.set(symKey, store);
+  }
+
+  return store;
+}
+
 /** @type {Set<string>} */
 const currentUpstreamSymbols = new Set();
 let upstreamApplyTimer = null;
@@ -283,24 +319,30 @@ const server = http.createServer((req, res) => {
 
     const nowIso = new Date().toISOString();
 
-    // Phase 5-6 (slice 1): endpoint must exist and must never 500 on empty cache.
-    // Cache store is introduced in later slices; for now we return an explicit MISS.
+    // --- Phase 5-3: wire endpoint to the store; still safe on empty ---
+    const store = getOrInitCandleStore(resRaw, symbol);
+
+    let cacheStatus = "MISS";
+    if (store.lastUpdateTsMs != null) {
+      cacheStatus = store.candles.length > 0 ? "HIT" : "EMPTY";
+    }
+
     const meta = {
       symbol,
       resolution: resRaw,
       window: {
         // v1 session boundary is defined later (Phase 5-5). Keep explicit fields now.
-        session_key: null,
-        session_start_ts: null,
+        session_key: intradaySession.sessionKey,
+        session_start_ts: intradaySession.sessionStartTsMs != null ? new Date(intradaySession.sessionStartTsMs).toISOString() : null,
       },
-      last_update_ts: null,
+      last_update_ts: store.lastUpdateTsMs != null ? new Date(store.lastUpdateTsMs).toISOString() : null,
       as_of_ts: nowIso,
       source: "cache",
       is_stale: Boolean(providerStatus.isStale),
-      cache_status: "MISS",
+      cache_status: cacheStatus,
     };
 
-    return json(res, 200, { candles: [], meta });
+    return json(res, 200, { candles: store.candles, meta });
   }
 
   return json(res, 404, { ok: false, error: "NOT_FOUND" });
