@@ -169,6 +169,43 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  if (url.pathname === "/candles/intraday") {
+    const symbolRaw = url.searchParams.get("symbol") ?? "";
+    const resRaw = (url.searchParams.get("res") ?? "").toLowerCase();
+
+    const symbol = symbolRaw.trim().toUpperCase();
+    const allowedRes = new Set(["1m", "5m", "30m"]);
+
+    if (!symbol) {
+      return json(res, 400, { ok: false, error: "BAD_REQUEST", detail: "missing_symbol" });
+    }
+
+    if (!allowedRes.has(resRaw)) {
+      return json(res, 400, { ok: false, error: "BAD_REQUEST", detail: "bad_res" });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // Phase 5-6 (slice 1): endpoint must exist and must never 500 on empty cache.
+    // Cache store is introduced in later slices; for now we return an explicit MISS.
+    const meta = {
+      symbol,
+      resolution: resRaw,
+      window: {
+        // v1 session boundary is defined later (Phase 5-5). Keep explicit fields now.
+        session_key: null,
+        session_start_ts: null,
+      },
+      last_update_ts: null,
+      as_of_ts: nowIso,
+      source: "cache",
+      is_stale: Boolean(providerStatus.isStale),
+      cache_status: "MISS",
+    };
+
+    return json(res, 200, { candles: [], meta });
+  }
+
   return json(res, 404, { ok: false, error: "NOT_FOUND" });
 });
 
