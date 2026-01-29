@@ -8,7 +8,104 @@ const HOST = "0.0.0.0";
 
 const STALE_AFTER_MS = Number(process.env.STALE_AFTER_MS ?? 15000);
 // Keep this small but never absurdly tight (protects CPU + avoids spam on reconnect loops).
+
 const SYMBOL_STATUS_BROADCAST_MS = Math.max(250, Number(process.env.SYMBOL_STATUS_BROADCAST_MS ?? 1000));
+
+// --- Phase 5-2: deterministic resolution config + bucketing (market TZ) ---
+// Note: Intraday cache is session-bounded and deterministic; bucketing must be a pure function.
+const MARKET_TZ = process.env.MARKET_TZ ?? "America/New_York";
+
+/** @type {Record<string, number>} */
+const RES_MINUTES = {
+  "1m": 1,
+  "5m": 5,
+  "30m": 30,
+};
+
+function parseGmtOffsetToMinutes(gmtOffsetText) {
+  // Examples: "GMT-5", "GMT-05:00", "GMT+1", "GMT+01:30"
+  const s = String(gmtOffsetText ?? "").trim();
+  if (!s.startsWith("GMT")) return 0;
+  const rest = s.slice(3); // "+01:00" or "-5"
+  if (!rest) return 0;
+
+  const sign = rest.startsWith("-") ? -1 : 1;
+  const num = rest.replace(/^[-+]/, "");
+
+  let hh = 0;
+  let mm = 0;
+
+  if (num.includes(":")) {
+    const [hStr, mStr] = num.split(":");
+    hh = Number(hStr);
+    mm = Number(mStr);
+  } else {
+    hh = Number(num);
+    mm = 0;
+  }
+
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return 0;
+  return sign * (hh * 60 + mm);
+}
+
+function getMarketParts(ms) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: MARKET_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+
+  const parts = dtf.formatToParts(new Date(ms));
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const p of parts) out[p.type] = p.value;
+
+  return {
+    year: Number(out.year),
+    month: Number(out.month),
+    day: Number(out.day),
+    hour: Number(out.hour),
+    minute: Number(out.minute),
+    second: Number(out.second),
+  };
+}
+
+function getMarketOffsetMinutes(ms) {
+  // Uses shortOffset so we get a stable numeric offset like GMT-05:00.
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: MARKET_TZ,
+    timeZoneName: "shortOffset",
+  });
+  const parts = dtf.formatToParts(new Date(ms));
+  const tzName = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT";
+  return parseGmtOffsetToMinutes(tzName);
+}
+
+/**
+ * Pure function: bucket start timestamp (ms epoch UTC) for an event timestamp and resolution.
+ * Candle ts is the start of the bucket in market TZ.
+ */
+function bucketStartTsMs(eventTsMs, res) {
+  const stepMin = RES_MINUTES[String(res)] ?? null;
+  if (!stepMin) throw new Error(`bad_resolution:${res}`);
+
+  const p = getMarketParts(eventTsMs);
+
+  // Floor to bucket start.
+  const bucketMinute = Math.floor(p.minute / stepMin) * stepMin;
+
+  // Construct a "local-as-UTC" timestamp, then adjust by the market offset at event time.
+  const localAsUtcMs = Date.UTC(p.year, p.month - 1, p.day, p.hour, bucketMinute, 0, 0);
+  const offsetMin = getMarketOffsetMinutes(eventTsMs);
+  const bucketUtcMs = localAsUtcMs - offsetMin * 60_000;
+
+  return bucketUtcMs;
+}
 
 /** @type {Map<string, any>} */
 const latestBySymbol = new Map();
