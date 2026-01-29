@@ -2,12 +2,12 @@
   "name": "@traderpro/realtime-ws",
   "private": true,
   "version": "0.1.0",
-  "type": "module",
-  "main": "dist/index.js",
+  "type": "commonjs",
+  "main": "dist/index.cjs",
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "build": "esbuild src/index.js --platform=node --format=esm --bundle --outfile=dist/index.js",
-    "start": "node dist/index.js"
+    "dev": "node src/index.js",
+    "build": "esbuild src/index.js --platform=node --format=cjs --bundle --outfile=dist/index.cjs",
+    "start": "node dist/index.cjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
