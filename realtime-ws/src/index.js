@@ -17,7 +17,7 @@ const lastSeenAtBySymbol = new Map();
 /** @type {Map<import("ws").WebSocket, Set<string>>} */
 const subsByClient = new Map();
 
-/** @type {{ enabled: boolean, feed: string|null, state: string, since: string, lastEventAt: string|null, lastError: string|null, isStale: boolean }} */
+/** @type {{ enabled: boolean, feed: string|null, state: string, since: string, lastEventAt: string|null, lastError: string|null, isStale: boolean, reconnectAttempt: number, nextRetryAt: number|null, lastDisconnectAt: number|null }} */
 const providerStatus = {
   enabled: false,
   feed: null,
@@ -26,6 +26,11 @@ const providerStatus = {
   lastEventAt: null,
   lastError: null,
   isStale: false,
+
+  // Phase 4B: explicit reconnect truth (UI must never infer continuity)
+  reconnectAttempt: 0,
+  nextRetryAt: null, // ms epoch
+  lastDisconnectAt: null, // ms epoch
 };
 
 function getTrackedSymbols() {
@@ -352,6 +357,10 @@ async function startAlpaca() {
     if (stopped) return;
     attempt += 1;
 
+    // Phase 4B truth: reflect attempt immediately on each connect/reconnect
+    providerStatus.reconnectAttempt = attempt;
+    providerStatus.nextRetryAt = null;
+
     setProviderState(attempt === 1 ? "connecting" : "reconnecting", { lastError: null });
 
     const ws = new WebSocket(ALPACA_WS_URL);
@@ -359,11 +368,33 @@ async function startAlpaca() {
     let authed = false;
     let subscribed = false;
 
+    const markSubscribed = () => {
+      if (subscribed) return;
+      subscribed = true;
+
+      // Phase 4B truth: reset reconnect bookkeeping on successful subscription
+      attempt = 0;
+      providerStatus.reconnectAttempt = 0;
+      providerStatus.nextRetryAt = null;
+      providerStatus.lastDisconnectAt = null;
+
+      setProviderState("subscribed");
+    };
+
     const scheduleReconnect = (why) => {
       if (stopped) return;
-      setProviderState("reconnecting", { lastError: why ?? "disconnected" });
+
+      const nowMs = Date.now();
+      providerStatus.lastDisconnectAt = nowMs;
+
+      // Existing backoff policy (min/max + exponential) — compute the actual scheduled delay.
       const backoff = clamp(ALPACA_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4), ALPACA_RECONNECT_MIN_MS, ALPACA_RECONNECT_MAX_MS);
-      setTimeout(connectOnce, jitter(backoff));
+      const delayMs = jitter(backoff);
+
+      providerStatus.nextRetryAt = nowMs + delayMs;
+
+      setProviderState("reconnecting", { lastError: why ?? "disconnected" });
+      setTimeout(connectOnce, delayMs);
     };
 
     ws.on("open", () => {
@@ -398,10 +429,7 @@ async function startAlpaca() {
 
         // SUBSCRIPTION ACK: SIP responds with T:"subscription"
         if (ev?.T === "subscription") {
-          if (!subscribed) {
-            subscribed = true;
-            setProviderState("subscribed");
-          }
+          markSubscribed();
           continue;
         }
 
@@ -420,8 +448,7 @@ async function startAlpaca() {
         if (!canonical) continue;
 
         if (!subscribed) {
-          subscribed = true;
-          setProviderState("subscribed");
+          markSubscribed();
         }
 
         broadcastMarketEvent(canonical);
