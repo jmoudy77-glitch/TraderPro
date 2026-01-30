@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Candle } from "@/lib/market-data/types";
 import type { ChartInstanceState } from "@/components/state/chart-types";
+import { realtimeState, type IntradayResolution } from "@/lib/realtime/realtimeState";
 
 type UseCandlesResult = {
-  candles: Candle[];
+  // Phase 6: truth-preserving candle array (shape depends on contract surface)
+  candles: any[];
   // Number of candles that correspond to the requested range at the requested resolution.
   // The server may return additional lookback candles for indicators.
   visibleCount: number | null;
@@ -21,16 +22,20 @@ const OWNER_USER_ID = process.env.NEXT_PUBLIC_DEV_OWNER_USER_ID ?? null;
 // - A minimum fetch interval prevents rapid UI churn from burning provider credits.
 // NOTE: This is per-browser-tab (in-memory). Server-side caching still applies separately.
 
-export type CandlesPayload = {
-  candles?: Candle[];
-  visibleCount?: number;
-  meta?: any;
-  // Server may return structured errors with 200 OK (e.g., CACHE_MISS)
-  ok?: boolean;
-  error?: string;
-  message?: string;
-  retryAfterMs?: number;
-};
+export type CandlesPayload =
+  | {
+      candles: any[];
+      meta: any;
+    }
+  | {
+      ok: false;
+      error: {
+        code: string;
+        message: string;
+        upstream: "fly";
+        status: number | null;
+      };
+    };
 
 type ClientCacheEntry = { expiresAt: number; payload: CandlesPayload };
 const CLIENT_CACHE = new Map<string, ClientCacheEntry>();
@@ -108,7 +113,7 @@ function stableTargetKey(instance: ChartInstanceState): string {
 }
 
 export function useCandles(instance: ChartInstanceState): UseCandlesResult {
-  const [candles, setCandles] = useState<Candle[]>([]);
+  const [candles, setCandles] = useState<any[]>([]);
   const [visibleCount, setVisibleCount] = useState<number | null>(null);
   const [meta, setMeta] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
@@ -134,9 +139,9 @@ export function useCandles(instance: ChartInstanceState): UseCandlesResult {
       const cached = clientCacheGet(requestKey);
       if (!cached) return;
 
-      setCandles(cached.candles ?? []);
-      setVisibleCount(typeof cached.visibleCount === "number" ? cached.visibleCount : null);
-      setMeta(cached.meta ?? null);
+      setCandles((cached as any).candles ?? []);
+      setVisibleCount(null);
+      setMeta((cached as any).meta ?? null);
       setError(null);
       setLoading(false);
     };
@@ -173,9 +178,9 @@ export function useCandles(instance: ChartInstanceState): UseCandlesResult {
       // Serve from client cache when available (prevents re-render storms from refetching).
       const cached = clientCacheGet(requestKey);
       if (cached) {
-        setCandles(cached.candles ?? []);
-        setVisibleCount(typeof cached.visibleCount === "number" ? cached.visibleCount : null);
-        setMeta(cached.meta ?? null);
+        setCandles((cached as any).candles ?? []);
+        setVisibleCount(null);
+        setMeta((cached as any).meta ?? null);
         setLoading(false);
         setError(null);
         return;
@@ -201,101 +206,72 @@ export function useCandles(instance: ChartInstanceState): UseCandlesResult {
       setLoading(true);
       setError(null);
 
+      // Phase 6: candles are sourced only from realtime-ws via the Vercel proxy.
+      // This hook currently supports SYMBOL/IXIC targets only under the Phase 6 contract.
       const isLegacyIxic = instance.target.type === "IXIC";
-      const targetParam = isLegacyIxic ? "SYMBOL" : instance.target.type;
+      const symbol = isLegacyIxic
+        ? "QQQ"
+        : instance.target.type === "SYMBOL"
+          ? String((instance.target as any).symbol ?? "").trim().toUpperCase()
+          : "";
 
-      const params = new URLSearchParams({
-        target: targetParam,
-        range: instance.range,
-        resolution: instance.resolution,
-      });
+      const res = String(instance.resolution ?? "").trim() as IntradayResolution;
+      const isSupportedRes = res === "1m" || res === "5m" || res === "30m";
 
-      if (targetParam === "SYMBOL") {
-        // If it's the legacy IXIC target, force QQQ as the proxy symbol.
-        params.set("symbol", isLegacyIxic ? "QQQ" : (instance.target as any).symbol);
+      if (!symbol || !isSupportedRes) {
+        // Unsupported target/range/resolution under Phase 6.
+        setCandles([]);
+        setVisibleCount(null);
+        setMeta({
+          ok: false,
+          error: {
+            code: "UNSUPPORTED",
+            message: "Unsupported candles request under Phase 6 contract",
+            upstream: "fly",
+            status: null,
+          },
+        });
+        setLoading(false);
+        setError(null);
+        return;
       }
-
-      if (instance.target.type === "WATCHLIST_COMPOSITE") {
-        const watchlistKey = instance.target.watchlistKey;
-        params.set("watchlistKey", watchlistKey);
-        if (OWNER_USER_ID) params.set("ownerUserId", OWNER_USER_ID);
-
-        // Cache-driven by default: do not allow UI-driven warming.
-        // Sentinel is the exception: it is allowed to warm the server cache on page load.
-        if ((watchlistKey as string) !== "SENTINEL") {
-          params.set("cacheOnly", "1");
-        }
-      }
-
-      const url = `/api/market/candles?${params.toString()}`;
 
       try {
-        const res = await fetch(url);
+        // Ensure central realtime state is started (idempotent) and fetch intraday candles.
+        realtimeState.start();
 
-        // If server returned a structured error, surface it.
-        if (!res.ok) {
-          let message = `HTTP ${res.status}`;
-          try {
-            const errJson = await res.json();
-            if (errJson?.message) message = String(errJson.message);
-            else if (errJson?.error) message = String(errJson.error);
-          } catch {
-            // ignore json parse errors
-          }
-          throw new Error(message);
-        }
+        const json = (await realtimeState.fetchIntradayCandles(symbol, res, undefined)) as any;
 
-        const json = (await res.json()) as CandlesPayload;
-
-        // Some endpoints intentionally return structured errors with 200 OK (e.g., CACHE_MISS).
-        // CACHE_MISS is a *soft* miss: do not surface as an error and do not clear existing UI state.
-        // Also cache the miss briefly to prevent re-render storms from re-requesting the miss repeatedly.
+        // Proxy guarantee: either {candles, meta} or {ok:false, error:{...}}
         if (json && json.ok === false) {
-          if (json.error === "CACHE_MISS") {
-            if (!cancelled) {
-              // Keep existing candles/meta; just stop loading.
-              setError(null);
-              setLoading(false);
+          // Treat as renderable truth, not an exception.
+          if (!cancelled) {
+            setCandles([]);
+            setVisibleCount(null);
+            setMeta(json);
+            setError(null);
 
-              // Respect server-provided retry timing (or a small fallback) without poisoning the client cache.
-              const retryMs = typeof json.retryAfterMs === "number" && json.retryAfterMs > 0 ? json.retryAfterMs : 2_000;
-              const ttlMs = Math.min(CLIENT_CACHE_TTL_MS, retryMs);
-              nextAllowedAtRef.current[requestKey] = Date.now() + ttlMs;
-            }
-            return;
+            lastFetchAtRef.current[requestKey] = Date.now();
+            nextAllowedAtRef.current[requestKey] = 0;
+
+            clientCacheSet(requestKey, json as any, CLIENT_CACHE_TTL_MS);
           }
-
-          const msg = json.message || json.error || "Request failed";
-          const e = new Error(String(msg));
-          (e as any).code = json.error;
-          (e as any).retryAfterMs = typeof json.retryAfterMs === "number" ? json.retryAfterMs : undefined;
-          throw e;
+          return;
         }
 
         if (!cancelled) {
-          setCandles(json.candles ?? []);
-          setVisibleCount(typeof json.visibleCount === "number" ? json.visibleCount : null);
-          setMeta(json.meta ?? null);
+          setCandles(Array.isArray(json?.candles) ? json.candles : []);
+          setVisibleCount(null);
+          setMeta(json?.meta ?? null);
 
           lastFetchAtRef.current[requestKey] = Date.now();
           nextAllowedAtRef.current[requestKey] = 0;
 
           // Populate client cache to avoid refetch storms.
-          clientCacheSet(requestKey, json, CLIENT_CACHE_TTL_MS);
+          clientCacheSet(requestKey, json as any, CLIENT_CACHE_TTL_MS);
         }
       } catch (err: any) {
         if (!cancelled) {
-          const code = err?.code ? String(err.code) : null;
-
-          if (code === "CACHE_MISS") {
-            // Soft miss: keep existing state; do not show an error.
-            setError(null);
-            const retryMs = typeof err?.retryAfterMs === "number" && err.retryAfterMs > 0 ? err.retryAfterMs : 2_000;
-            const ttlMs = Math.min(CLIENT_CACHE_TTL_MS, retryMs);
-            nextAllowedAtRef.current[requestKey] = Date.now() + ttlMs;
-            return;
-          }
-
           setError(err?.message ?? "Failed to fetch candles");
           setCandles([]);
           setVisibleCount(null);
