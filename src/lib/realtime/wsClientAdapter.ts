@@ -53,6 +53,8 @@ type AdapterState = {
   lastMessageAt: number | null;
   providerStatus: ProviderStatus | null;
   symbolStatus: SymbolStatusState;
+  // Truth-preserving: raw md/latest payloads keyed by symbol
+  lastTickBySymbol: Record<string, any>;
   lastError: LastError;
 };
 
@@ -88,6 +90,7 @@ export class RealtimeWsClientAdapter {
       lastSeenAtBySymbol: {},
       isStaleBySymbol: {},
     },
+    lastTickBySymbol: {},
     lastError: null,
   };
 
@@ -104,6 +107,9 @@ export class RealtimeWsClientAdapter {
   get symbolStatus() {
     return this.state.symbolStatus;
   }
+  get lastTickBySymbol() {
+    return this.state.lastTickBySymbol;
+  }
   get lastError() {
     return this.state.lastError;
   }
@@ -118,6 +124,7 @@ export class RealtimeWsClientAdapter {
         lastSeenAtBySymbol: { ...this.state.symbolStatus.lastSeenAtBySymbol },
         isStaleBySymbol: { ...this.state.symbolStatus.isStaleBySymbol },
       },
+      lastTickBySymbol: { ...this.state.lastTickBySymbol },
     };
   }
 
@@ -196,8 +203,12 @@ export class RealtimeWsClientAdapter {
 
         case "md":
         case "latest": {
-          // Phase 6-3 allows ignoring or storing minimal info.
-          // We do not reinterpret; Phase 6-4 will decide what to store centrally.
+          // Truth-preserving: store the raw payload (verbatim) keyed by symbol.
+          const anyMsg = msg as any;
+          const symbol = String(anyMsg.symbol ?? "").trim().toUpperCase();
+          if (symbol) {
+            this.state.lastTickBySymbol[symbol] = anyMsg;
+          }
           this.emit();
           return;
         }
