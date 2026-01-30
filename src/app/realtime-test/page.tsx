@@ -14,6 +14,10 @@ function parseSymbolsFromQuery(): string[] {
     .filter(Boolean);
 }
 
+if (process.env.NODE_ENV !== "production") {
+  (window as any).realtimeWsAdapter = realtimeWsAdapter;
+}
+
 export default function RealtimeTestPage() {
   const defaultSyms = useMemo(() => parseSymbolsFromQuery(), []);
   const symbols = defaultSyms.length ? defaultSyms : ["SPY", "QQQ", "AAPL"];

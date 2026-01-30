@@ -1,3 +1,7 @@
+// Deprecated in Phase 6-3.
+// This module must not own a WebSocket connection.
+// Use `src/lib/realtime/wsClientAdapter.ts` (the single socket owner) instead.
+
 export type ProviderStatus = {
   enabled: boolean;
   feed: string | null;
@@ -54,84 +58,40 @@ type Handlers = {
   onError?: (e: Event) => void;
 };
 
-export class RealtimeWsClient {
-  private ws: WebSocket | null = null;
-  private readonly url: string;
-  private readonly handlers: Handlers;
+function deprecated(): never {
+  throw new Error(
+    "RealtimeWsClient is deprecated in Phase 6-3. Use realtimeWsAdapter from src/lib/realtime/wsClientAdapter.ts (single socket owner)."
+  );
+}
 
-  constructor(url: string, handlers: Handlers = {}) {
-    this.url = url;
-    this.handlers = handlers;
+// Kept only to avoid breaking legacy imports.
+// It intentionally does NOT create/own a WebSocket.
+export class RealtimeWsClient {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  constructor(_url: string, _handlers: Handlers = {}) {
+    // no-op
   }
 
   connect() {
-    if (this.ws) return;
-
-    const ws = new WebSocket(this.url);
-    this.ws = ws;
-
-    ws.addEventListener("open", () => this.handlers.onOpen?.());
-    ws.addEventListener("close", () => {
-      this.ws = null;
-      this.handlers.onClose?.();
-    });
-    ws.addEventListener("error", (e) => this.handlers.onError?.(e));
-
-    ws.addEventListener("message", (ev) => {
-      let msg: IncomingMessage | null = null;
-      try {
-        msg = JSON.parse(String(ev.data));
-      } catch {
-        return;
-      }
-
-      if (!msg || typeof msg !== "object") return;
-
-      if (msg.type === "provider_status") {
-        this.handlers.onProviderStatus?.((msg as ProviderStatusPayload).provider_status);
-        return;
-      }
-
-      if (msg.type === "symbol_status") {
-        this.handlers.onSymbolStatus?.(msg as SymbolStatusPayload);
-        // also surface provider status from the same payload
-        this.handlers.onProviderStatus?.((msg as SymbolStatusPayload).provider_status);
-        return;
-      }
-
-      if (msg.type === "md") {
-        this.handlers.onMarketData?.(msg as MarketDataPayload);
-        this.handlers.onProviderStatus?.((msg as MarketDataPayload).provider_status);
-        return;
-      }
-    });
+    deprecated();
   }
 
   close() {
-    try {
-      this.ws?.close();
-    } catch {
-      // noop
-    } finally {
-      this.ws = null;
-    }
+    // no-op (legacy safe)
   }
 
-  subscribe(symbols: string[]) {
-    this.send({ type: "subscribe", symbols });
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  subscribe(_symbols: string[]) {
+    deprecated();
   }
 
-  unsubscribe(symbols: string[]) {
-    this.send({ type: "unsubscribe", symbols });
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  unsubscribe(_symbols: string[]) {
+    deprecated();
   }
 
-  getLatest(symbols: string[]) {
-    this.send({ type: "get_latest", symbols });
-  }
-
-  private send(msg: any) {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify(msg));
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  getLatest(_symbols: string[]) {
+    deprecated();
   }
 }
