@@ -48,19 +48,26 @@ function parseGmtOffsetToMinutes(gmtOffsetText) {
   return sign * (hh * 60 + mm);
 }
 
-function getMarketParts(ms) {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: MARKET_TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  });
+// Memoized Intl formatters (constructing these per call is expensive and can starve the event loop).
+const DTF_MARKET_PARTS = new Intl.DateTimeFormat("en-US", {
+  timeZone: MARKET_TZ,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
 
-  const parts = dtf.formatToParts(new Date(ms));
+// Uses shortOffset so we get a stable numeric offset like GMT-05:00.
+const DTF_MARKET_OFFSET = new Intl.DateTimeFormat("en-US", {
+  timeZone: MARKET_TZ,
+  timeZoneName: "shortOffset",
+});
+
+function getMarketParts(ms) {
+  const parts = DTF_MARKET_PARTS.formatToParts(new Date(ms));
   /** @type {Record<string, string>} */
   const out = {};
   for (const p of parts) out[p.type] = p.value;
@@ -76,12 +83,7 @@ function getMarketParts(ms) {
 }
 
 function getMarketOffsetMinutes(ms) {
-  // Uses shortOffset so we get a stable numeric offset like GMT-05:00.
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: MARKET_TZ,
-    timeZoneName: "shortOffset",
-  });
-  const parts = dtf.formatToParts(new Date(ms));
+  const parts = DTF_MARKET_OFFSET.formatToParts(new Date(ms));
   const tzName = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT";
   return parseGmtOffsetToMinutes(tzName);
 }
