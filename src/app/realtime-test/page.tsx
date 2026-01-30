@@ -14,7 +14,7 @@ function parseSymbolsFromQuery(): string[] {
     .filter(Boolean);
 }
 
-if (process.env.NODE_ENV !== "production") {
+if (process.env.NODE_ENV !== "production" && typeof window !== "undefined") {
   (window as any).realtimeWsAdapter = realtimeWsAdapter;
 }
 
