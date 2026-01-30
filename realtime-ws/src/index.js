@@ -498,18 +498,53 @@ function jitter(ms) {
   return Math.round(ms * (1 + r));
 }
 
+function toEventTsMs(t) {
+  // Alpaca WS timestamps may be RFC3339 strings or numeric (ms / ns). Normalize to epoch ms.
+  if (t == null) return null;
+
+  if (typeof t === "string") {
+    const ms = Date.parse(t);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof t === "number") {
+    if (!Number.isFinite(t)) return null;
+
+    // Heuristics:
+    // - ns epoch ~ 1e18
+    // - ms epoch ~ 1e12
+    // - s epoch  ~ 1e9
+    if (t >= 1e15) return Math.floor(t / 1e6); // ns -> ms
+    if (t >= 1e12) return Math.floor(t); // ms
+    if (t >= 1e9) return Math.floor(t * 1000); // seconds -> ms
+    return null;
+  }
+
+  return null;
+}
+
 function normalizeAlpacaEvent(ev) {
   const sym = String(ev?.S ?? "").trim().toUpperCase();
   if (!sym) return null;
 
+  const tsMs = toEventTsMs(ev?.t);
+
   if (ev?.T === "t") {
-    return { type: "trade", symbol: sym, ts: ev?.t ?? null, price: ev?.p ?? null, size: ev?.s ?? null, source: "alpaca" };
+    return {
+      type: "trade",
+      symbol: sym,
+      ts: tsMs,
+      price: ev?.p ?? null,
+      size: ev?.s ?? null,
+      source: "alpaca",
+    };
   }
+
   if (ev?.T === "q") {
     return {
       type: "quote",
       symbol: sym,
-      ts: ev?.t ?? null,
+      ts: tsMs,
       bid: ev?.bp ?? null,
       ask: ev?.ap ?? null,
       bidSize: ev?.bs ?? null,
@@ -517,9 +552,21 @@ function normalizeAlpacaEvent(ev) {
       source: "alpaca",
     };
   }
+
   if (ev?.T === "b") {
-    return { type: "bar", symbol: sym, ts: ev?.t ?? null, o: ev?.o ?? null, h: ev?.h ?? null, l: ev?.l ?? null, c: ev?.c ?? null, v: ev?.v ?? null, source: "alpaca" };
+    return {
+      type: "bar",
+      symbol: sym,
+      ts: tsMs,
+      o: ev?.o ?? null,
+      h: ev?.h ?? null,
+      l: ev?.l ?? null,
+      c: ev?.c ?? null,
+      v: ev?.v ?? null,
+      source: "alpaca",
+    };
   }
+
   return null;
 }
 
