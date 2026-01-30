@@ -9,6 +9,7 @@ import { computeRsi, normalizeCandles } from "@/lib/market-data/indicators";
 import MacdPane from "@/components/charts/MacdPane";
 import type { IChartApi } from "lightweight-charts";
 import { useEffect, useMemo, useState } from "react";
+import SymbolFreshnessBadge from "@/components/realtime/SymbolFreshnessBadge";
 
 function labelForTarget(t: any) {
   if (t.type === "SYMBOL") return t.symbol;
@@ -124,6 +125,8 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
       <div className="flex items-center justify-between border-b border-neutral-800 px-2 py-1">
         <div className="text-[11px] font-medium text-neutral-200">
           {labelForTarget(instance.target)}
+
+          {symbol ? <SymbolFreshnessBadge symbol={symbol} /> : null}
         </div>
         <div className="flex items-center gap-2 text-[10px] text-neutral-500">
           <button

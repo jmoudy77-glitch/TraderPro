@@ -11,6 +11,7 @@ import ChartControls from "@/components/charts/ChartControls";
 import IndicatorToggles from "@/components/charts/IndicatorToggles";
 import { useEffect, useState } from "react";
 import type { IChartApi, UTCTimestamp } from "lightweight-charts";
+import SymbolFreshnessBadge from "@/components/realtime/SymbolFreshnessBadge";
 
 function Pill({ children }: { children: React.ReactNode }) {
   return (
@@ -120,6 +121,8 @@ export function ChartPanel({
         <div className="flex items-center gap-2">
           <div className="text-sm font-medium">{title}</div>
           <Pill>{targetLabel(instance.target)}</Pill>
+
+          <SymbolFreshnessBadge symbol={symbol} />
         </div>
 
         {mode === "full" && (
