@@ -12,6 +12,7 @@ import {
 } from "react";
 import ChartModal from "../modals/ChartModal";
 import AnalysisGridModal from "../modals/AnalysisGridModal";
+import ProviderStatusIndicator from "../realtime/ProviderStatusIndicator";
 
 // -------------------- Modal Manager (minimal v1) --------------------
 type ModalType = "chart" | "analysisGrid";
@@ -495,6 +496,8 @@ export default function AppShell({ children }: { children: ReactNode }) {
           </div>
         </div>
 
+        <ProviderStatusIndicator />
+        
         <nav className="flex items-center gap-3 text-xs text-neutral-300">
           <span className="rounded border border-neutral-800 px-2 py-1">
             Desktop Shell
