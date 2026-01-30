@@ -363,6 +363,13 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  // --- Phase 5-8: Stale read truth ---
+  // If upstream is stale or disconnected:
+  //   • return last known candles (if any)
+  //   • meta.is_stale = true
+  //   • meta.last_update_ts does NOT advance
+  //   • no candle mutation occurs
+  // The UI must never infer freshness.
   if (url.pathname === "/candles/intraday") {
     const symbolRaw = url.searchParams.get("symbol") ?? "";
     const resRaw = (url.searchParams.get("res") ?? "").toLowerCase();
@@ -409,7 +416,7 @@ const server = http.createServer((req, res) => {
       last_update_ts: store.lastUpdateTsMs != null ? new Date(store.lastUpdateTsMs).toISOString() : null,
       as_of_ts: nowIso,
       source: "cache",
-      is_stale: Boolean(providerStatus.isStale),
+      is_stale: providerStatus.state !== "subscribed" || Boolean(providerStatus.isStale),
       cache_status: cacheStatus,
     };
 
@@ -417,6 +424,12 @@ const server = http.createServer((req, res) => {
     const windowStart = intradaySession.sessionStartTsMs;
 
     const all = windowStart != null ? store.candles.filter((c) => c.ts >= windowStart) : store.candles;
+    // Phase 5-8: if provider is stale, freeze the view (no mutation, no inference)
+    // We still return existing candles truthfully, but meta.is_stale=true and
+    // last_update_ts must not advance beyond last known store update.
+    if (providerStatus.state !== "subscribed" || providerStatus.isStale) {
+      // No-op by design: candle data is returned as-is, freshness is expressed via meta
+    }
 
     const totalCount = all.length;
     const candles = totalCount > limit ? all.slice(totalCount - limit) : all;
@@ -836,7 +849,7 @@ function scheduleUpstreamApply(reason) {
 }
 
 function broadcastMarketEvent(canonical, meta = null) {
-  if (providerStatus.state !== "subscribed") return;
+  if (providerStatus.state !== "subscribed" || providerStatus.isStale) return;
   ensureIntradaySession(Date.now());
 
   providerStatus.lastEventAt = new Date().toISOString();
