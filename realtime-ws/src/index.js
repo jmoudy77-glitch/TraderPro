@@ -319,6 +319,14 @@ const server = http.createServer((req, res) => {
 
     const nowIso = new Date().toISOString();
 
+    // Optional: bound payload size so callers can safely inspect first/last candles.
+    const limitRaw = url.searchParams.get("limit");
+    let limit = Number(limitRaw ?? "");
+    if (!Number.isFinite(limit) || limit <= 0) limit = 500;
+    limit = Math.floor(limit);
+    // Hard clamp to protect memory/latency even if the caller requests something huge.
+    limit = Math.max(1, Math.min(5000, limit));
+
     // --- Phase 5-3: wire endpoint to the store; still safe on empty ---
     const store = getOrInitCandleStore(resRaw, symbol);
 
@@ -342,7 +350,14 @@ const server = http.createServer((req, res) => {
       cache_status: cacheStatus,
     };
 
-    return json(res, 200, { candles: store.candles, meta });
+    const totalCount = store.candles.length;
+    const candles = totalCount > limit ? store.candles.slice(totalCount - limit) : store.candles;
+
+    meta.limit = limit;
+    meta.returned_count = candles.length;
+    meta.total_count = totalCount;
+
+    return json(res, 200, { candles, meta });
   }
 
   return json(res, 404, { ok: false, error: "NOT_FOUND" });
