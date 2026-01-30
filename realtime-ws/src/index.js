@@ -123,6 +123,64 @@ const intradaySession = {
   sessionStartTsMs: null,
 };
 
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function computeMarketSessionKey(ms) {
+  const p = getMarketParts(ms);
+  return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+}
+
+function marketMidnightUtcMs(year, month, day) {
+  // Find the UTC instant that corresponds to 00:00:00 in MARKET_TZ for the given Y-M-D.
+  // Uses a small fixed-point iteration to converge.
+  let guess = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+
+  for (let i = 0; i < 4; i++) {
+    const p = getMarketParts(guess);
+
+    // Compute how far (in minutes) the current market-local time is from desired local midnight.
+    let minuteOfDay = p.hour * 60 + p.minute;
+
+    // If the market-local date is not the target day, adjust minuteOfDay by whole-day offsets.
+    // (This can happen because `guess` is in UTC and the market TZ may be behind/ahead.)
+    if (p.year !== year || p.month !== month || p.day !== day) {
+      // Compare dates by constructing a simple ordinal-like value.
+      const ord = (yy, mm, dd) => yy * 10000 + mm * 100 + dd;
+      const targetOrd = ord(year, month, day);
+      const gotOrd = ord(p.year, p.month, p.day);
+
+      if (gotOrd < targetOrd) minuteOfDay -= 24 * 60;
+      if (gotOrd > targetOrd) minuteOfDay += 24 * 60;
+    }
+
+    // Move the guess backward by the observed local minutes-from-midnight.
+    guess -= minuteOfDay * 60_000;
+  }
+
+  return guess;
+}
+
+function resetIntradaySession(nowMs, newKey) {
+  intradaySession.sessionKey = newKey;
+
+  const p = getMarketParts(nowMs);
+  intradaySession.sessionStartTsMs = marketMidnightUtcMs(p.year, p.month, p.day);
+
+  // Clear all intraday candle stores (Phase 5-5).
+  for (const bySymbol of candlesByResThenSymbol.values()) {
+    bySymbol.clear();
+  }
+}
+
+function ensureIntradaySession(nowMs) {
+  const key = computeMarketSessionKey(nowMs);
+  if (intradaySession.sessionKey !== key) {
+    resetIntradaySession(nowMs, key);
+  }
+}
+
 /**
  * candlesByResThenSymbol.get(res).get(symbol) -> { candles: [], lastUpdateTsMs }
  *
@@ -281,6 +339,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === "/health") {
     const nowMs = Date.now();
+    ensureIntradaySession(nowMs);
     updateProviderStaleFlag(nowMs);
     const { lastSeenAtBySymbolObj, isStaleBySymbolObj } = computeSymbolFreshness(nowMs);
     const tracked = Object.keys(lastSeenAtBySymbolObj);
@@ -317,7 +376,9 @@ const server = http.createServer((req, res) => {
       return json(res, 400, { ok: false, error: "BAD_REQUEST", detail: "bad_res" });
     }
 
-    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    ensureIntradaySession(nowMs);
+    const nowIso = new Date(nowMs).toISOString();
 
     // Optional: bound payload size so callers can safely inspect first/last candles.
     const limitRaw = url.searchParams.get("limit");
@@ -350,8 +411,13 @@ const server = http.createServer((req, res) => {
       cache_status: cacheStatus,
     };
 
-    const totalCount = store.candles.length;
-    const candles = totalCount > limit ? store.candles.slice(totalCount - limit) : store.candles;
+    // Enforce session-bounded window (Phase 5-5).
+    const windowStart = intradaySession.sessionStartTsMs;
+
+    const all = windowStart != null ? store.candles.filter((c) => c.ts >= windowStart) : store.candles;
+
+    const totalCount = all.length;
+    const candles = totalCount > limit ? all.slice(totalCount - limit) : all;
 
     meta.limit = limit;
     meta.returned_count = candles.length;
@@ -769,6 +835,7 @@ function scheduleUpstreamApply(reason) {
 
 function broadcastMarketEvent(canonical, meta = null) {
   if (providerStatus.state !== "subscribed") return;
+  ensureIntradaySession(Date.now());
 
   providerStatus.lastEventAt = new Date().toISOString();
   lastSeenAtBySymbol.set(canonical.symbol, Date.now()); // arrival-time freshness
@@ -777,6 +844,10 @@ function broadcastMarketEvent(canonical, meta = null) {
   // --- Phase 5-4: candle builder (trade-first) ---
   if (canonical.type === "trade" && typeof canonical.ts === "number" && typeof canonical.price === "number") {
     const eventTsMs = canonical.ts;
+    // Enforce session boundary on writes: ignore events outside current session window.
+    if (intradaySession.sessionStartTsMs != null && eventTsMs < intradaySession.sessionStartTsMs) {
+      return;
+    }
     const price = canonical.price;
     const size = Number(canonical.size ?? 0);
 
