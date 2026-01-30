@@ -765,7 +765,7 @@ function broadcastMarketEvent(canonical, meta = null) {
     const price = canonical.price;
     const size = Number(canonical.size ?? 0);
 
-    for (const resKey of RES_MINUTES.keys()) {
+    for (const resKey of Object.keys(RES_MINUTES)) {
       const store = getOrInitCandleStore(resKey, canonical.symbol);
       const bucketTsMs = bucketStartTsMs(eventTsMs, resKey);
 
