@@ -1280,11 +1280,26 @@ export default function WatchlistsPanel() {
   };
 
   const toggleHeldLocal = async (symbol: string) => {
-    const next = !Boolean(heldBySymbol[symbol]);
-    setHeldBySymbol((prev) => ({ ...prev, [symbol]: next }));
+    const sym = symbol.trim().toUpperCase();
+    if (!sym) return;
+
+    const next = !Boolean(heldBySymbol[sym]);
+
+    setHeldBySymbol((prev) => ({ ...prev, [sym]: next }));
+
+    try {
+      window.dispatchEvent(
+        new CustomEvent("tp:held:toggle", {
+          detail: { symbol: sym, held: next },
+        })
+      );
+    } catch {
+      // ignore
+    }
+
     if (OWNER_USER_ID) {
       try {
-        await setHeld(OWNER_USER_ID, symbol, next);
+        await setHeld(OWNER_USER_ID, sym, next);
       } catch {}
     }
   };

@@ -95,7 +95,32 @@ const state: RealtimeState = {
   intradayByKey: {},
 };
 
+
 const listeners = new Set<Listener>();
+
+const viewSymbolsById = new Map<string, string[]>();
+
+function arraysEqual(a: string[], b: string[]) {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function recomputeTrackedFromViews() {
+  const union = new Set<string>();
+  for (const syms of viewSymbolsById.values()) {
+    for (const s of syms) union.add(s);
+  }
+  const next = Array.from(union).sort();
+
+  // prevent churn
+  if (arraysEqual(next, state.trackedSymbols)) return;
+
+  state.trackedSymbols = next;
+  realtimeWsAdapter.setTrackedSymbols(next);
+  emit();
+}
 
 function buildSnapshot(): RealtimeState {
   return {
@@ -177,6 +202,29 @@ export const realtimeState = {
     state.trackedSymbols = next;
     realtimeWsAdapter.setTrackedSymbols(next);
     emit();
+  },
+
+  setViewSymbols(viewId: string, symbols: string[]) {
+    const id = String(viewId ?? "").trim();
+    if (!id) return;
+
+    const next = normalizeSymbols(symbols).sort();
+    const prev = viewSymbolsById.get(id) ?? [];
+
+    if (arraysEqual(prev, next)) return;
+
+    viewSymbolsById.set(id, next);
+    recomputeTrackedFromViews();
+  },
+
+  clearViewSymbols(viewId: string) {
+    const id = String(viewId ?? "").trim();
+    if (!id) return;
+
+    if (!viewSymbolsById.has(id)) return;
+
+    viewSymbolsById.delete(id);
+    recomputeTrackedFromViews();
   },
 
   async refreshHealth(): Promise<HealthPayload> {

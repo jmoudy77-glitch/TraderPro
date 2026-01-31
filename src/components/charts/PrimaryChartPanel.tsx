@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import type { IChartApi, UTCTimestamp } from "lightweight-charts";
 import SymbolFreshnessBadge from "@/components/realtime/SymbolFreshnessBadge";
 import IntradayFreshnessOverlay from "@/components/realtime/IntradayFreshnessOverlay";
+import { realtimeState } from "@/lib/realtime/realtimeState";
 
 function Pill({ children }: { children: React.ReactNode }) {
   return (
@@ -56,6 +57,21 @@ export function ChartPanel({
   const activeTime = typeof activeTimeProp !== "undefined" ? activeTimeProp : activeTimeLocal;
   const { candles, visibleCount, meta, loading, error } = useCandles(instance as any) as any;
   const symbol = instance.target.type === "SYMBOL" ? instance.target.symbol : null;
+
+  useEffect(() => {
+    const viewId = `chart-panel:${chartKey}`;
+
+    if (symbol) {
+      realtimeState.setViewSymbols(viewId, [symbol]);
+    } else {
+      realtimeState.clearViewSymbols(viewId);
+    }
+
+    return () => {
+      realtimeState.clearViewSymbols(viewId);
+    };
+  }, [chartKey, symbol]);
+
   const priceIn = symbol ? getLocalPriceIn(symbol) : null;
 
   useEffect(() => {
