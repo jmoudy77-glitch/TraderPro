@@ -33,7 +33,8 @@ type Action =
       type: "RESET_INSTANCE";
       key: ChartKey;
       overrides?: Partial<Pick<ChartInstanceState, "target" | "range" | "resolution" | "indicators">>;
-    };
+    }
+  | { type: "SET_TARGETS"; updates: Array<{ key: ChartKey; target: ChartTarget }> };
 
 function makeDefaultState(): ChartStateMap {
   return {
@@ -376,6 +377,23 @@ function isSameIndicators(a: Indicators, b: Indicators) {
 }
 
 function reducer(state: ChartStateMap, action: Action): ChartStateMap {
+  // SET_TARGETS does not use action.key
+  if (action.type === "SET_TARGETS") {
+    let next = state;
+    let changed = false;
+    for (const { key, target } of action.updates) {
+      const current = next[key];
+      if (!current) continue;
+      if (isSameTarget(current.target, target)) continue;
+      if (!changed) {
+        next = { ...next };
+        changed = true;
+      }
+      next[key] = { ...current, target };
+    }
+    return next;
+  }
+
   const current = state[action.key];
   if (!current) return state;
 
@@ -433,6 +451,7 @@ type ChartStateContextValue = {
   setResolution: (key: ChartKey, resolution: ChartResolution) => void;
   toggleIndicator: (key: ChartKey, name: keyof Indicators) => void;
   setIndicators: (key: ChartKey, indicators: Indicators) => void;
+  setTargets: (updates: Array<{ key: ChartKey; target: ChartTarget }>) => void;
 
   // Modal chart key allocation (v1)
   allocateModalKey: () => ChartKey;
@@ -479,6 +498,12 @@ export function ChartStateProvider({ children }: { children: React.ReactNode }) 
       key: ChartKey,
       overrides?: Partial<Pick<ChartInstanceState, "target" | "range" | "resolution" | "indicators">>
     ) => dispatch({ type: "RESET_INSTANCE", key, overrides }),
+    []
+  );
+
+  const setTargets = useCallback(
+    (updates: Array<{ key: ChartKey; target: ChartTarget }>) =>
+      dispatch({ type: "SET_TARGETS", updates }),
     []
   );
 
@@ -541,6 +566,7 @@ export function ChartStateProvider({ children }: { children: React.ReactNode }) 
       setResolution,
       toggleIndicator,
       setIndicators,
+      setTargets,
       allocateModalKey,
       releaseModalKey,
     };
@@ -551,6 +577,7 @@ export function ChartStateProvider({ children }: { children: React.ReactNode }) 
     setResolution,
     toggleIndicator,
     setIndicators,
+    setTargets,
     allocateModalKey,
     releaseModalKey,
   ]);

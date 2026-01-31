@@ -223,7 +223,7 @@ export class RealtimeWsClientAdapter {
         default: {
           // Unknown message types must not crash. Dev-log is optional.
           if (process.env.NODE_ENV !== "production") {
-            // eslint-disable-next-line no-console
+             
             console.debug("[ws-adapter] unknown message type:", (msg as any).type);
           }
           this.emit();

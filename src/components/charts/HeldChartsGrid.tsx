@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import SymbolFreshnessBadge from "@/components/realtime/SymbolFreshnessBadge";
 import IntradayFreshnessOverlay from "@/components/realtime/IntradayFreshnessOverlay";
 import { realtimeState } from "@/lib/realtime/realtimeState";
+import { useExposureSymbols } from "@/lib/exposure/useExposureSymbols";
 
 function labelForTarget(t: any) {
   if (t.type === "SYMBOL") return t.symbol;
@@ -21,6 +22,7 @@ function labelForTarget(t: any) {
 }
 
 function MiniChartCard({ chartKey }: { chartKey: string }) {
+  const { instance } = useChartInstance(chartKey as any);
   const [miniChart, setMiniChart] = useState<IChartApi | null>(null);
   const [activeTime, setActiveTime] = useState<number | null>(null);
 
@@ -36,8 +38,6 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
       miniChart.unsubscribeCrosshairMove(handler);
     };
   }, [miniChart]);
-
-  const { instance, setTarget } = useChartInstance(chartKey as any);
 
   const { candles, loading, error, meta } = useCandles(instance);
 
@@ -232,6 +232,22 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
 }
 
 export default function HeldChartsGrid() {
+  const exposureSymbolsRaw = useExposureSymbols();
+
+  const exposureSymbols = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const s of exposureSymbolsRaw ?? []) {
+      const sym = String(s ?? "").trim().toUpperCase();
+      if (!sym) continue;
+      if (seen.has(sym)) continue;
+      seen.add(sym);
+      out.push(sym);
+      if (out.length >= 6) break;
+    }
+    return out;
+  }, [exposureSymbolsRaw]);
+
   const slot1 = useChartInstance(CHART_KEYS.GRID_1 as any);
   const slot2 = useChartInstance(CHART_KEYS.GRID_2 as any);
   const slot3 = useChartInstance(CHART_KEYS.GRID_3 as any);
@@ -239,69 +255,33 @@ export default function HeldChartsGrid() {
   const slot5 = useChartInstance(CHART_KEYS.GRID_5 as any);
   const slot6 = useChartInstance(CHART_KEYS.GRID_6 as any);
 
-  const slots = useMemo(
-    () => [
-      { key: CHART_KEYS.GRID_1, instance: slot1.instance, setTarget: slot1.setTarget },
-      { key: CHART_KEYS.GRID_2, instance: slot2.instance, setTarget: slot2.setTarget },
-      { key: CHART_KEYS.GRID_3, instance: slot3.instance, setTarget: slot3.setTarget },
-      { key: CHART_KEYS.GRID_4, instance: slot4.instance, setTarget: slot4.setTarget },
-      { key: CHART_KEYS.GRID_5, instance: slot5.instance, setTarget: slot5.setTarget },
-      { key: CHART_KEYS.GRID_6, instance: slot6.instance, setTarget: slot6.setTarget },
-    ],
-    [
-      slot1.instance,
-      slot1.setTarget,
-      slot2.instance,
-      slot2.setTarget,
-      slot3.instance,
-      slot3.setTarget,
-      slot4.instance,
-      slot4.setTarget,
-      slot5.instance,
-      slot5.setTarget,
-      slot6.instance,
-      slot6.setTarget,
-    ]
-  );
-
   useEffect(() => {
-    const handler = (e: Event) => {
-      const ce = e as CustomEvent;
-      const detail = (ce?.detail ?? {}) as any;
-      const symbol = String(detail.symbol ?? "").trim().toUpperCase();
-      const held = Boolean(detail.held);
-      if (!symbol) return;
+    const slots = [slot1, slot2, slot3, slot4, slot5, slot6];
 
-      const current = slots.map((s) =>
-        s.instance.target.type === "SYMBOL" ? s.instance.target.symbol : null
-      );
+    for (let i = 0; i < slots.length; i++) {
+      const desired = exposureSymbols[i] ?? null;
+      const current = slots[i].instance.target;
 
-      if (held) {
-        // If already present, no-op.
-        if (current.some((s) => s === symbol)) return;
-
-        // Fill the first EMPTY slot.
-        const emptyIdx = slots.findIndex((s) => s.instance.target.type === "EMPTY");
-        if (emptyIdx === -1) return;
-
-        slots[emptyIdx].setTarget({ type: "SYMBOL", symbol } as any);
-        return;
+      if (!desired) {
+        if (current.type !== "EMPTY") {
+          slots[i].setTarget({ type: "EMPTY" } as any);
+        }
+        continue;
       }
 
-      // held=false: clear any slot currently holding this symbol.
-      const idx = slots.findIndex(
-        (s) => s.instance.target.type === "SYMBOL" && s.instance.target.symbol === symbol
-      );
-      if (idx === -1) return;
+      if (current.type === "SYMBOL" && current.symbol === desired) continue;
 
-      slots[idx].setTarget({ type: "EMPTY" } as any);
-    };
-
-    window.addEventListener("tp:held:toggle", handler as any);
-    return () => {
-      window.removeEventListener("tp:held:toggle", handler as any);
-    };
-  }, [slots]);
+      slots[i].setTarget({ type: "SYMBOL", symbol: desired } as any);
+    }
+  }, [
+    exposureSymbols,
+    slot1,
+    slot2,
+    slot3,
+    slot4,
+    slot5,
+    slot6,
+  ]);
 
   return (
     <section className="flex h-full min-h-0 flex-col rounded-lg border border-neutral-800 bg-neutral-950">

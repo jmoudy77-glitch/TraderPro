@@ -10,7 +10,6 @@ import {
   getWatchlistSymbols,
   reorderWatchlistSymbol,
   removeWatchlistSymbol,
-  setHeld,
   setPriceIn,
   softDeleteWatchlist,
 } from "@/app/actions/holdings";
@@ -23,11 +22,10 @@ type RowVariant = "TRADE_LIST" | "SENTINEL";
 type WatchlistSymbolDTO = {
   symbol: string;
   priceIn: number | null;
-  held: boolean;
 };
 
 type TradeWatchlistKey = Exclude<WatchlistKey, "SENTINEL">;
-type HoldingsMap = Record<string, { priceIn: number | null; held: boolean }>;
+type HoldingsMap = Record<string, { priceIn: number | null }>;
 
 type SymbolMeta = {
   sector: string;
@@ -141,9 +139,7 @@ function SymbolRow({
   onSendToGrid,
   variant,
   priceIn,
-  held,
   onEditPriceIn,
-  onToggleHeld,
   showReorderControls,
   onMove,
   pctChange,
@@ -161,9 +157,7 @@ function SymbolRow({
   onSendToGrid: () => void;
   variant: RowVariant;
   priceIn: number | null;
-  held: boolean;
   onEditPriceIn: () => void;
-  onToggleHeld: () => void;
   showReorderControls?: boolean;
   onMove?: (direction: "up" | "down") => void;
   pctChange?: number;
@@ -174,7 +168,7 @@ function SymbolRow({
   onRemove?: () => void;
 }) {
   return (
-    <div className="grid w-full grid-cols-[minmax(0,1fr)_96px_72px_auto_auto_auto_auto_auto] items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-2">
+    <div className="grid w-full grid-cols-[minmax(0,1fr)_96px_72px_auto_auto_auto_auto] items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-2">
       {/* 1. Symbol + industry micro-pill */}
       <div className="flex min-w-0 items-center gap-2">
         <button
@@ -243,16 +237,6 @@ function SymbolRow({
               <span className="h-[22px]" />
             )}
           </div>
-
-          {/* Held */}
-          <button
-            type="button"
-            onClick={onToggleHeld}
-            className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-[11px] text-neutral-200 hover:border-neutral-700"
-            title="Toggle held"
-          >
-            {held ? "Held" : "Not held"}
-          </button>
 
           {/* IN @ */}
           <button
@@ -435,7 +419,6 @@ function WatchlistCard({
   variant = "TRADE_LIST",
   getSymbolState,
   onEditPriceIn,
-  onToggleHeld,
   onIntel,
   canAdd,
   onRequestAdd,
@@ -458,9 +441,8 @@ function WatchlistCard({
   watchlistKey: string;
   symbols: string[];
   variant?: RowVariant;
-  getSymbolState: (symbol: string) => { priceIn: number | null; held: boolean };
+  getSymbolState: (symbol: string) => { priceIn: number | null };
   onEditPriceIn: (symbol: string) => void;
-  onToggleHeld: (symbol: string) => void;
   onIntel: (symbol: string) => void;
   canAdd?: boolean;
   onRequestAdd?: () => void;
@@ -514,7 +496,7 @@ function WatchlistCard({
   const rows: WatchlistSymbolDTO[] = useMemo(() => {
     return symbols.map((symbol) => {
       const st = getSymbolState(symbol);
-      return { symbol, priceIn: st.priceIn, held: st.held };
+      return { symbol, priceIn: st.priceIn };
     });
   }, [getSymbolState, symbols]);
 
@@ -734,66 +716,64 @@ function WatchlistCard({
           {/* SENTINEL: keep flat list (no sector grouping) */}
           {variant === "SENTINEL" ? (
             <div className="space-y-2">
-              {rows.map((row) => {
-                const meta = symbolMetaBySymbol[row.symbol.toUpperCase()];
-                return (
-                  <SymbolRow
-                    key={row.symbol}
-                    symbol={row.symbol}
-                    canRemove
-                    onRemove={() => onRemoveSymbol?.(row.symbol)}
-                    industry={meta?.industry ?? null}
-                    industryAbbrev={meta?.industryAbbrev ?? null}
-                    variant={variant}
-                    priceIn={row.priceIn}
-                    held={row.held}
-                    onPromote={() => {
-                      const id =
-                        (globalThis.crypto as any)?.randomUUID?.() ||
-                        `chart-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-                      window.dispatchEvent(
-                        new CustomEvent("tp:modal:open", {
-                          detail: {
-                            id,
-                            type: "chart",
-                            title: row.symbol,
-                            position: { x: 120, y: 120 },
-                            size: { w: 720, h: 520 },
-                            state: {
-                              target: { type: "SYMBOL", symbol: row.symbol },
-                              range: "1D",
-                              resolution: "5m",
-                              indicators: {
-                                rsi: true,
-                                macd: true,
-                                sma50: false,
-                                sma200: false,
-                              },
-                              source: "watchlistRow",
-                            },
+          {rows.map((row) => {
+            const meta = symbolMetaBySymbol[row.symbol.toUpperCase()];
+            return (
+              <SymbolRow
+                key={row.symbol}
+                symbol={row.symbol}
+                canRemove
+                onRemove={() => onRemoveSymbol?.(row.symbol)}
+                industry={meta?.industry ?? null}
+                industryAbbrev={meta?.industryAbbrev ?? null}
+                variant={variant}
+                priceIn={row.priceIn}
+                onPromote={() => {
+                  const id =
+                    (globalThis.crypto as any)?.randomUUID?.() ||
+                    `chart-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+                  window.dispatchEvent(
+                    new CustomEvent("tp:modal:open", {
+                      detail: {
+                        id,
+                        type: "chart",
+                        title: row.symbol,
+                        position: { x: 120, y: 120 },
+                        size: { w: 720, h: 520 },
+                        state: {
+                          target: { type: "SYMBOL", symbol: row.symbol },
+                          range: "1D",
+                          resolution: "5m",
+                          indicators: {
+                            rsi: true,
+                            macd: true,
+                            sma50: false,
+                            sma200: false,
                           },
-                        })
-                      );
-                    }}
-                    showReorderControls={false}
-                    onMove={undefined}
-                    onIntel={() => onIntel(row.symbol)}
-                    onSendToGrid={() => {
-                      window.dispatchEvent(
-                        new CustomEvent("tp:analysisGrid:addSymbols", {
-                          detail: { symbols: [row.symbol] },
-                        })
-                      );
-                    }}
-                    onEditPriceIn={() => onEditPriceIn(row.symbol)}
-                    onToggleHeld={() => onToggleHeld(row.symbol)}
-                    pctChange={compositeMeta?.constituents?.[row.symbol]?.pctChange}
-                    prevClose={compositeMeta?.constituents?.[row.symbol]?.prevClose}
-                    prevCloseDate={compositeMeta?.constituents?.[row.symbol]?.prevCloseDate}
-                    sparklinePoints={compositeMeta?.constituents?.[row.symbol]?.sparkline1d}
-                  />
-                );
-              })}
+                          source: "watchlistRow",
+                        },
+                      },
+                    })
+                  );
+                }}
+                showReorderControls={false}
+                onMove={undefined}
+                onIntel={() => onIntel(row.symbol)}
+                onSendToGrid={() => {
+                  window.dispatchEvent(
+                    new CustomEvent("tp:analysisGrid:addSymbols", {
+                      detail: { symbols: [row.symbol] },
+                    })
+                  );
+                }}
+                onEditPriceIn={() => onEditPriceIn(row.symbol)}
+                pctChange={compositeMeta?.constituents?.[row.symbol]?.pctChange}
+                prevClose={compositeMeta?.constituents?.[row.symbol]?.prevClose}
+                prevCloseDate={compositeMeta?.constituents?.[row.symbol]?.prevCloseDate}
+                sparklinePoints={compositeMeta?.constituents?.[row.symbol]?.sparkline1d}
+              />
+            );
+          })}
             </div>
           ) : (
             <div className="space-y-3">
@@ -844,7 +824,6 @@ function WatchlistCard({
                             industryAbbrev={meta?.industryAbbrev ?? null}
                             variant={variant}
                             priceIn={row.priceIn}
-                            held={row.held}
                             onPromote={() => {
                               const id =
                                 (globalThis.crypto as any)?.randomUUID?.() ||
@@ -884,7 +863,6 @@ function WatchlistCard({
                               );
                             }}
                             onEditPriceIn={() => onEditPriceIn(row.symbol)}
-                            onToggleHeld={() => onToggleHeld(row.symbol)}
                             pctChange={compositeMeta?.constituents?.[row.symbol]?.pctChange}
                             prevClose={compositeMeta?.constituents?.[row.symbol]?.prevClose}
                             prevCloseDate={compositeMeta?.constituents?.[row.symbol]?.prevCloseDate}
@@ -909,7 +887,6 @@ export default function WatchlistsPanel() {
   const [intelSymbol, setIntelSymbol] = useState<string | null>(null);
 
   const [priceInBySymbol, setPriceInBySymbol] = useState<Record<string, number | null>>({});
-  const [heldBySymbol, setHeldBySymbol] = useState<Record<string, boolean>>({});
 
   const [priceInEditorOpen, setPriceInEditorOpen] = useState(false);
   const [priceInEditorSymbol, setPriceInEditorSymbol] = useState<string | null>(null);
@@ -1111,15 +1088,12 @@ export default function WatchlistsPanel() {
         if (cancelled) return;
 
         const nextPrice: Record<string, number | null> = {};
-        const nextHeld: Record<string, boolean> = {};
 
         for (const [symbol, st] of Object.entries(map)) {
           nextPrice[symbol] = st.priceIn;
-          nextHeld[symbol] = st.held;
         }
 
         setPriceInBySymbol(nextPrice);
-        setHeldBySymbol(nextHeld);
       } catch {
         // fail-silent (v1)
       }
@@ -1230,7 +1204,6 @@ export default function WatchlistsPanel() {
 
   const getSymbolState = (symbol: string) => ({
     priceIn: Object.prototype.hasOwnProperty.call(priceInBySymbol, symbol) ? priceInBySymbol[symbol] ?? null : null,
-    held: Object.prototype.hasOwnProperty.call(heldBySymbol, symbol) ? Boolean(heldBySymbol[symbol]) : false,
   });
 
   const openIntel = (symbol: string) => {
@@ -1279,30 +1252,6 @@ export default function WatchlistsPanel() {
     closePriceInEditor();
   };
 
-  const toggleHeldLocal = async (symbol: string) => {
-    const sym = symbol.trim().toUpperCase();
-    if (!sym) return;
-
-    const next = !Boolean(heldBySymbol[sym]);
-
-    setHeldBySymbol((prev) => ({ ...prev, [sym]: next }));
-
-    try {
-      window.dispatchEvent(
-        new CustomEvent("tp:held:toggle", {
-          detail: { symbol: sym, held: next },
-        })
-      );
-    } catch {
-      // ignore
-    }
-
-    if (OWNER_USER_ID) {
-      try {
-        await setHeld(OWNER_USER_ID, sym, next);
-      } catch {}
-    }
-  };
 
   const openAdd = (key: string) => {
     setAddOpenKey(key);
@@ -1499,7 +1448,6 @@ export default function WatchlistsPanel() {
           symbols={symbolsByWatchlistKey["SENTINEL"] ?? []}
           getSymbolState={getSymbolState}
           onEditPriceIn={() => {}}
-          onToggleHeld={() => {}}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("SENTINEL")}
@@ -1524,7 +1472,6 @@ export default function WatchlistsPanel() {
           symbols={symbolsByWatchlistKey["LAUNCH_LEADERS"] ?? []}
           getSymbolState={getSymbolState}
           onEditPriceIn={editPriceIn}
-          onToggleHeld={toggleHeldLocal}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("LAUNCH_LEADERS")}
@@ -1551,7 +1498,6 @@ export default function WatchlistsPanel() {
           symbols={symbolsByWatchlistKey["HIGH_VELOCITY_MULTIPLIERS"] ?? []}
           getSymbolState={getSymbolState}
           onEditPriceIn={editPriceIn}
-          onToggleHeld={toggleHeldLocal}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("HIGH_VELOCITY_MULTIPLIERS")}
@@ -1578,7 +1524,6 @@ export default function WatchlistsPanel() {
           symbols={symbolsByWatchlistKey["SLOW_BURNERS"] ?? []}
           getSymbolState={getSymbolState}
           onEditPriceIn={editPriceIn}
-          onToggleHeld={toggleHeldLocal}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("SLOW_BURNERS")}
@@ -1611,7 +1556,6 @@ export default function WatchlistsPanel() {
                   symbols={symbolsByWatchlistKey[k] ?? []}
                   getSymbolState={getSymbolState}
                   onEditPriceIn={editPriceIn}
-                  onToggleHeld={toggleHeldLocal}
                   onIntel={openIntel}
                   canAdd
                   onRequestAdd={() => openAdd(k)}
