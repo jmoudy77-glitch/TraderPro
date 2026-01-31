@@ -352,7 +352,7 @@ const server = http.createServer((req, res) => {
       service: "realtime-ws",
       now: new Date(nowMs).toISOString(),
       clients: subsByClient.size,
-      symbolsTracked: latestBySymbol.size,
+      symbolsTracked: tracked.length,
       providerStatus,
       staleAfterMs: STALE_AFTER_MS,
       symbols: {
