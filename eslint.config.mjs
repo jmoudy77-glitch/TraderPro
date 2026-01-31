@@ -1,8 +1,18 @@
-import { defineConfig, globalIgnores } from "eslint/config";
+import { defineConfig } from "eslint/config";
 import nextVitals from "eslint-config-next/core-web-vitals";
 import nextTs from "eslint-config-next/typescript";
 
 const eslintConfig = defineConfig([
+  {
+    ignores: [
+      "realtime-ws/dist/**",
+      "realtime-ws/.fly/**",
+      ".next/**",
+      "out/**",
+      "build/**",
+      "dist/**",
+    ],
+  },
   ...nextVitals,
   ...nextTs,
   {
@@ -15,19 +25,16 @@ const eslintConfig = defineConfig([
       "src/components/state/ChartStateProvider.tsx",
       "src/components/watchlists/WatchlistsPanel.tsx",
       "src/lib/market-data/twelvedata.ts",
+      "src/app/actions/**",
+      "src/lib/realtime/**",
+      "src/components/realtime/**",
+      "src/components/charts/HeldChartsGrid.tsx",
+      "src/app/realtime-test/**",
     ],
     rules: {
       "@typescript-eslint/no-explicit-any": "warn",
     },
   },
-  // Override default ignores of eslint-config-next.
-  globalIgnores([
-    // Default ignores of eslint-config-next:
-    ".next/**",
-    "out/**",
-    "build/**",
-    "next-env.d.ts",
-  ]),
 ]);
 
 export default eslintConfig;
