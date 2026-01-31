@@ -165,5 +165,85 @@ export const realtimeState = {
     }
   },
 
-  // (rest of file unchanged)
+  stop() {
+    // explicit stop: disconnect socket and stop updates
+    realtimeWsAdapter.disconnect();
+    state.connectionState = "disconnected";
+    emit();
+  },
+
+  setTrackedSymbols(symbols: string[]) {
+    const next = normalizeSymbols(symbols);
+    state.trackedSymbols = next;
+    realtimeWsAdapter.setTrackedSymbols(next);
+    emit();
+  },
+
+  async refreshHealth(): Promise<HealthPayload> {
+    const res = await fetch("/api/realtime/health", { method: "GET", cache: "no-store" });
+    const text = await res.text();
+
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = {
+        ok: false,
+        error: {
+          code: "BAD_JSON",
+          message: "Non-JSON response",
+          upstream: "fly",
+          status: null,
+        },
+      };
+    }
+
+    state.lastHealth = json as HealthPayload;
+    emit();
+    return state.lastHealth;
+  },
+
+  async fetchIntradayCandles(
+    symbol: string,
+    res: IntradayResolution,
+    limit?: number
+  ): Promise<CandlesPayload> {
+    const sym = String(symbol ?? "").trim().toUpperCase();
+
+    const params = new URLSearchParams();
+    params.set("symbol", sym);
+    params.set("res", res);
+    if (limit != null) params.set("limit", String(limit));
+
+    const url = `/api/realtime/candles/intraday?${params.toString()}`;
+    const httpRes = await fetch(url, { method: "GET", cache: "no-store" });
+    const text = await httpRes.text();
+
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = {
+        ok: false,
+        error: {
+          code: "BAD_JSON",
+          message: "Non-JSON response",
+          upstream: "fly",
+          status: null,
+        },
+      };
+    }
+
+    const k = keyFor(sym, res);
+    state.intradayByKey[k] = {
+      key: k,
+      symbol: sym,
+      res,
+      payload: json as CandlesPayload,
+      fetchedAt: Date.now(),
+    };
+    emit();
+
+    return state.intradayByKey[k].payload;
+  },
 };

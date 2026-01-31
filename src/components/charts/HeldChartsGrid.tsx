@@ -10,6 +10,7 @@ import MacdPane from "@/components/charts/MacdPane";
 import type { IChartApi } from "lightweight-charts";
 import { useEffect, useMemo, useState } from "react";
 import SymbolFreshnessBadge from "@/components/realtime/SymbolFreshnessBadge";
+import IntradayFreshnessOverlay from "@/components/realtime/IntradayFreshnessOverlay";
 
 function labelForTarget(t: any) {
   if (t.type === "SYMBOL") return t.symbol;
@@ -37,7 +38,7 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
 
   const { instance } = useChartInstance(chartKey as any);
 
-  const { candles, loading, error } = useCandles(instance);
+  const { candles, loading, error, meta } = useCandles(instance);
 
   const rsiSeries = useMemo(() => {
     if (!candles || candles.length < 20) return [];
@@ -186,7 +187,7 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
         )}
 
         <div className="min-h-0 flex-1">
-          <div className="h-full w-full overflow-hidden rounded-sm border border-neutral-900">
+          <div className="relative h-full w-full overflow-hidden rounded-sm border border-neutral-900">
             <CandlesChart
               candles={candles}
               variant="mini"
@@ -195,6 +196,7 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
               showSma200={instance.indicators.sma200}
               onChartReady={setMiniChart}
             />
+            <IntradayFreshnessOverlay meta={meta} candlesCount={candles.length} />
           </div>
         </div>
         {instance.indicators.macd && miniChart && (

@@ -12,6 +12,7 @@ import IndicatorToggles from "@/components/charts/IndicatorToggles";
 import { useEffect, useState } from "react";
 import type { IChartApi, UTCTimestamp } from "lightweight-charts";
 import SymbolFreshnessBadge from "@/components/realtime/SymbolFreshnessBadge";
+import IntradayFreshnessOverlay from "@/components/realtime/IntradayFreshnessOverlay";
 
 function Pill({ children }: { children: React.ReactNode }) {
   return (
@@ -53,7 +54,7 @@ export function ChartPanel({
   const [chartApi, setChartApi] = useState<IChartApi | null>(null);
   const [activeTimeLocal, setActiveTimeLocal] = useState<UTCTimestamp | null>(null);
   const activeTime = typeof activeTimeProp !== "undefined" ? activeTimeProp : activeTimeLocal;
-  const { candles, visibleCount, loading, error } = useCandles(instance as any) as any;
+  const { candles, visibleCount, meta, loading, error } = useCandles(instance as any) as any;
   const symbol = instance.target.type === "SYMBOL" ? instance.target.symbol : null;
   const priceIn = symbol ? getLocalPriceIn(symbol) : null;
 
@@ -122,7 +123,7 @@ export function ChartPanel({
           <div className="text-sm font-medium">{title}</div>
           <Pill>{targetLabel(instance.target)}</Pill>
 
-          <SymbolFreshnessBadge symbol={symbol} />
+          {symbol ? <SymbolFreshnessBadge symbol={symbol} /> : null}
         </div>
 
         {mode === "full" && (
@@ -166,6 +167,8 @@ export function ChartPanel({
             {candles.length} bars • last close {candles[candles.length - 1].close.toFixed(2)}
           </div>
         )}
+
+        <IntradayFreshnessOverlay meta={meta} candlesCount={candles.length} />
 
         <div className="flex h-full w-full min-h-0 flex-col gap-2">
           <div
