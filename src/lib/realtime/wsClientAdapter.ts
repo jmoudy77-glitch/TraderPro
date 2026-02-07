@@ -44,9 +44,15 @@ type SymbolStatusMsg = {
 type MdMsg =
   | ({ type: "md"; symbol: string; ts: number } & Record<string, any>)
   | ({ type: "latest"; symbol: string; ts: number } & Record<string, any>);
+type Ticks1sMsg = {
+  type: "ticks_1s";
+  ts: number;
+  ticks: Record<string, { p: number; t: number }>;
+  provider_status?: ProviderStatus;
+};
 type ErrorMsg = { type: "error"; code: string; message: string };
 
-type IncomingMsg = HelloMsg | ProviderStatusMsg | SymbolStatusMsg | MdMsg | ErrorMsg | { type: string; [k: string]: any };
+type IncomingMsg = HelloMsg | ProviderStatusMsg | SymbolStatusMsg | Ticks1sMsg | MdMsg | ErrorMsg | { type: string; [k: string]: any };
 
 type AdapterState = {
   connectionState: ConnectionState;
@@ -201,14 +207,66 @@ export class RealtimeWsClientAdapter {
           return;
         }
 
-        case "md":
-        case "latest": {
-          // Truth-preserving: store the raw payload (verbatim) keyed by symbol.
-          const anyMsg = msg as any;
-          const symbol = String(anyMsg.symbol ?? "").trim().toUpperCase();
-          if (symbol) {
-            this.state.lastTickBySymbol[symbol] = anyMsg;
+        case "ticks_1s": {
+          const m = msg as Ticks1sMsg;
+          const ticks = m.ticks;
+
+          if (ticks && typeof ticks === "object") {
+            for (const [symRaw, v] of Object.entries(ticks as Record<string, { p: number; t: number }>)) {
+              const sym = String(symRaw ?? "").trim().toUpperCase();
+              if (!sym || !v) continue;
+
+              this.state.lastTickBySymbol[sym] = {
+                p: v.p,
+                t: v.t,
+              };
+            }
           }
+
+          if (m.provider_status) {
+            this.state.providerStatus = m.provider_status;
+          }
+
+          this.emit();
+          return;
+        }
+
+        case "md": {
+          const anyMsg = msg as any;
+
+          // realtime-ws shape: { type:"md", event:{symbol, ts, price, ...}, provider_status:{...} }
+          const ev = (anyMsg?.event ?? null) as any;
+          const symbol = String(ev?.symbol ?? "").trim().toUpperCase();
+
+          if (symbol) {
+            this.state.lastTickBySymbol[symbol] = {
+              ...(ev ?? {}),
+              provider_status: anyMsg?.provider_status ?? null,
+            };
+          }
+
+          // Keep provider status truth-preserving when present.
+          if (anyMsg?.provider_status) {
+            this.state.providerStatus = anyMsg.provider_status;
+          }
+
+          this.emit();
+          return;
+        }
+
+        case "latest": {
+          const anyMsg = msg as any;
+
+          // realtime-ws shape: { type:"latest", latest:{ [SYM]: event } }
+          const latest = anyMsg?.latest;
+          if (latest && typeof latest === "object") {
+            for (const [k, v] of Object.entries(latest)) {
+              const sym = String(k ?? "").trim().toUpperCase();
+              if (!sym) continue;
+              this.state.lastTickBySymbol[sym] = v as any;
+            }
+          }
+
           this.emit();
           return;
         }
@@ -331,10 +389,18 @@ export class RealtimeWsClientAdapter {
     }
   }
 
-  private emit(): void {
+  private emitScheduled = false;
+
+private emit(): void {
+  if (this.emitScheduled) return;
+  this.emitScheduled = true;
+
+  queueMicrotask(() => {
+    this.emitScheduled = false;
     const snapshot = this.getState();
     for (const l of this.listeners) l(snapshot);
-  }
+  });
+}
 
   private setConnectionState(next: ConnectionState): void {
     if (this.state.connectionState === next) return;

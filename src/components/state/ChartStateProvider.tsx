@@ -4,12 +4,15 @@ import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useReducer,
   useRef,
+  useState,
 } from "react";
 import type { ChartKey } from "@/components/state/chart-keys";
 import { CHART_KEYS } from "@/components/state/chart-keys";
+import type { HorizontalLevel } from "@/components/charts/draw/DrawTools";
 import {
   DEFAULT_INDICATORS,
   DEFAULT_RANGE,
@@ -21,7 +24,106 @@ import {
   type Indicators,
 } from "@/components/state/chart-types";
 
+// Range/Resolution coupling (Visible + auto-bump, no toast)
+// Canonical combos:
+// - 1D: 1h, 15m, 5m, 1m
+// - 5D: 4h, 1h (selecting <4h bumps to 1D; selecting 1D bumps to 1M)
+// - 1M: 1D, 4h (selecting <4h bumps to 1D)
+// - 3M/6M/1Y: 1D (selecting 4h bumps to 1M; selecting <4h bumps to 1D)
+
+const ALLOWED_RESOLUTIONS_BY_RANGE: Record<ChartTimeRange, ChartResolution[]> = {
+  "1D": ["1h", "15m", "5m", "1m"],
+  "5D": ["4h", "1h"],
+  "1M": ["1d", "4h"],
+  "3M": ["1d"],
+  "6M": ["1d"],
+  "1Y": ["1d"],
+};
+
+function isBelow4h(resolution: ChartResolution) {
+  return resolution === "1h" || resolution === "15m" || resolution === "5m" || resolution === "1m";
+}
+
+function coerceResolutionForRange(range: ChartTimeRange, preferred: ChartResolution): ChartResolution {
+  const allowed = ALLOWED_RESOLUTIONS_BY_RANGE[range] ?? [preferred];
+  if (allowed.includes(preferred)) return preferred;
+
+  // Stable defaults (no toast)
+  switch (range) {
+    case "1D":
+      return "1h";
+    case "5D":
+      return "4h";
+    case "1M":
+      // Prefer 4h unless user explicitly asked for 1d
+      return preferred === "1d" ? "1d" : "4h";
+    case "6M":
+    case "1Y":
+      return "1d";
+    default:
+      return allowed[0] ?? preferred;
+  }
+}
+
+function normalizeRangeResolution(
+  currentRange: ChartTimeRange,
+  requestedResolution: ChartResolution
+): { range: ChartTimeRange; resolution: ChartResolution } {
+  let range = currentRange;
+  const resolution = requestedResolution;
+
+  if (resolution === "1d") {
+    // Selecting 1D resolution from short ranges bumps to 1M
+    if (range === "1D" || range === "5D") range = "1M";
+  } else if (resolution === "4h") {
+    if (range === "1D") range = "5D";
+    if (range === "3M" || range === "6M" || range === "1Y") range = "1M";
+  } else if (isBelow4h(resolution)) {
+    // Sub-4h detail requires 1D range, except 1h is allowed in 5D
+    if (range === "5D") {
+      if (resolution !== "1h") range = "1D";
+    } else if (range === "1M" || range === "3M" || range === "6M" || range === "1Y") {
+      range = "1D";
+    }
+  }
+
+  return {
+    range,
+    resolution: coerceResolutionForRange(range, resolution),
+  };
+}
+
 type ChartStateMap = Record<string, ChartInstanceState>;
+
+const HORIZONTAL_LEVELS_STORAGE_KEY = "traderpro.horizontalLevels.v1";
+
+
+function chartTargetKey(target: ChartTarget): string {
+  switch (target.type) {
+    case "SYMBOL":
+      return `SYMBOL:${(target as any).symbol ?? ""}`;
+    case "WATCHLIST_COMPOSITE":
+      return `WATCHLIST_COMPOSITE:${(target as any).watchlistKey ?? ""}`;
+    default:
+      return target.type;
+  }
+}
+
+function horizontalLevelsEqual(a: HorizontalLevel[] | undefined, b: HorizontalLevel[] | undefined): boolean {
+  if (a === b) return true;
+  const aa = a ?? [];
+  const bb = b ?? [];
+  if (aa.length !== bb.length) return false;
+  for (let i = 0; i < aa.length; i++) {
+    const x = aa[i];
+    const y = bb[i];
+    if (!x || !y) return false;
+    if (x.id !== y.id) return false;
+    if (x.price !== y.price) return false;
+    if ((x.label ?? "") !== (y.label ?? "")) return false;
+  }
+  return true;
+}
 
 type Action =
   | { type: "SET_TARGET"; key: ChartKey; target: ChartTarget }
@@ -401,15 +503,37 @@ function reducer(state: ChartStateMap, action: Action): ChartStateMap {
     case "SET_TARGET":
       if (isSameTarget(current.target, action.target)) return state;
       return { ...state, [action.key]: { ...current, target: action.target } };
-    case "SET_RANGE":
+    case "SET_RANGE": {
       if (current.range === action.range) return state;
-      return { ...state, [action.key]: { ...current, range: action.range } };
-    case "SET_RESOLUTION":
-      if (current.resolution === action.resolution) return state;
+      const nextRange = action.range;
+      const nextResolution = coerceResolutionForRange(nextRange, current.resolution);
+      // Only update what actually changes
+      if (nextRange === current.range && nextResolution === current.resolution) return state;
       return {
         ...state,
-        [action.key]: { ...current, resolution: action.resolution },
+        [action.key]: {
+          ...current,
+          range: nextRange,
+          resolution: nextResolution,
+        },
       };
+    }
+    case "SET_RESOLUTION": {
+      if (current.resolution === action.resolution) return state;
+      const normalized = normalizeRangeResolution(current.range, action.resolution);
+      const nextRange = normalized.range;
+      const nextResolution = normalized.resolution;
+
+      if (nextRange === current.range && nextResolution === current.resolution) return state;
+      return {
+        ...state,
+        [action.key]: {
+          ...current,
+          range: nextRange,
+          resolution: nextResolution,
+        },
+      };
+    }
     case "SET_INDICATORS":
       if (isSameIndicators(current.indicators, action.indicators)) return state;
       return {
@@ -453,6 +577,12 @@ type ChartStateContextValue = {
   setIndicators: (key: ChartKey, indicators: Indicators) => void;
   setTargets: (updates: Array<{ key: ChartKey; target: ChartTarget }>) => void;
 
+  getHorizontalLevels: (target: ChartTarget) => HorizontalLevel[];
+  setHorizontalLevels: (target: ChartTarget, levels: HorizontalLevel[]) => void;
+  addHorizontalLevel: (target: ChartTarget, price: number, label?: string) => HorizontalLevel | null;
+  removeHorizontalLevel: (target: ChartTarget, id: string) => void;
+  clearHorizontalLevels: (target: ChartTarget) => void;
+
   // Modal chart key allocation (v1)
   allocateModalKey: () => ChartKey;
   releaseModalKey: (key: ChartKey) => void;
@@ -462,6 +592,34 @@ const ChartStateContext = createContext<ChartStateContextValue | null>(null);
 
 export function ChartStateProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, undefined, makeDefaultState);
+
+  const [horizontalLevelsByTarget, setHorizontalLevelsByTarget] = useState<Record<string, HorizontalLevel[]>>({});
+  const horizontalLevelsHydratedRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(HORIZONTAL_LEVELS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          setHorizontalLevelsByTarget(parsed as Record<string, HorizontalLevel[]>);
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      horizontalLevelsHydratedRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!horizontalLevelsHydratedRef.current) return;
+    try {
+      localStorage.setItem(HORIZONTAL_LEVELS_STORAGE_KEY, JSON.stringify(horizontalLevelsByTarget));
+    } catch {
+      // ignore
+    }
+  }, [horizontalLevelsByTarget]);
 
   const setTarget = useCallback(
     (key: ChartKey, target: ChartTarget) =>
@@ -506,6 +664,61 @@ export function ChartStateProvider({ children }: { children: React.ReactNode }) 
       dispatch({ type: "SET_TARGETS", updates }),
     []
   );
+
+  const getHorizontalLevels = useCallback(
+    (target: ChartTarget): HorizontalLevel[] => {
+      const key = chartTargetKey(target);
+      return horizontalLevelsByTarget[key] ?? [];
+    },
+    [horizontalLevelsByTarget]
+  );
+
+  const setHorizontalLevels = useCallback((target: ChartTarget, levels: HorizontalLevel[]) => {
+    const key = chartTargetKey(target);
+    setHorizontalLevelsByTarget((prev) => {
+      const cur = prev[key] ?? [];
+      if (horizontalLevelsEqual(cur, levels)) return prev;
+      return { ...prev, [key]: levels };
+    });
+  }, []);
+
+  const addHorizontalLevel = useCallback(
+    (target: ChartTarget, price: number, label?: string): HorizontalLevel | null => {
+      if (!Number.isFinite(price)) return null;
+      const key = chartTargetKey(target);
+      const lvl: HorizontalLevel = {
+        id: `pl_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        price,
+        label,
+      };
+      setHorizontalLevelsByTarget((prev) => {
+        const cur = prev[key] ?? [];
+        return { ...prev, [key]: [lvl, ...cur] };
+      });
+      return lvl;
+    },
+    []
+  );
+
+  const removeHorizontalLevel = useCallback((target: ChartTarget, id: string) => {
+    const key = chartTargetKey(target);
+    setHorizontalLevelsByTarget((prev) => {
+      const cur = prev[key] ?? [];
+      if (cur.length === 0) return prev;
+      const next = cur.filter((l) => l.id !== id);
+      if (next.length === cur.length) return prev;
+      return { ...prev, [key]: next };
+    });
+  }, []);
+
+  const clearHorizontalLevels = useCallback((target: ChartTarget) => {
+    const key = chartTargetKey(target);
+    setHorizontalLevelsByTarget((prev) => {
+      const cur = prev[key] ?? [];
+      if (cur.length === 0) return prev;
+      return { ...prev, [key]: [] };
+    });
+  }, []);
 
   const usedModalKeysRef = useRef<Set<ChartKey>>(new Set());
 
@@ -567,6 +780,11 @@ export function ChartStateProvider({ children }: { children: React.ReactNode }) 
       toggleIndicator,
       setIndicators,
       setTargets,
+      getHorizontalLevels,
+      setHorizontalLevels,
+      addHorizontalLevel,
+      removeHorizontalLevel,
+      clearHorizontalLevels,
       allocateModalKey,
       releaseModalKey,
     };
@@ -578,6 +796,11 @@ export function ChartStateProvider({ children }: { children: React.ReactNode }) 
     toggleIndicator,
     setIndicators,
     setTargets,
+    getHorizontalLevels,
+    setHorizontalLevels,
+    addHorizontalLevel,
+    removeHorizontalLevel,
+    clearHorizontalLevels,
     allocateModalKey,
     releaseModalKey,
   ]);
@@ -610,5 +833,11 @@ export function useChartInstance(key: ChartKey) {
       ctx.setResolution(key, resolution),
     toggleIndicator: (name: keyof Indicators) => ctx.toggleIndicator(key, name),
     setIndicators: (indicators: Indicators) => ctx.setIndicators(key, indicators),
+    horizontalLevels: ctx.getHorizontalLevels(instance.target),
+    addHorizontalLevel: (price: number, label?: string) =>
+      ctx.addHorizontalLevel(instance.target, price, label),
+    removeHorizontalLevel: (id: string) => ctx.removeHorizontalLevel(instance.target, id),
+    clearHorizontalLevels: () => ctx.clearHorizontalLevels(instance.target),
+    setHorizontalLevels: (levels: HorizontalLevel[]) => ctx.setHorizontalLevels(instance.target, levels),
   };
 }

@@ -25,6 +25,17 @@ function computeSectorCode(sector: string | null): string | null {
     .toUpperCase();
 }
 
+const SYMBOL_META_TTL_DAYS = Number(process.env.SYMBOL_META_TTL_DAYS ?? "30");
+
+function computeExpiresAt(updatedAt: string | null): string | null {
+  if (!updatedAt) return null;
+  const t = Date.parse(updatedAt);
+  if (!Number.isFinite(t)) return null;
+  const ttlDays = Number.isFinite(SYMBOL_META_TTL_DAYS) && SYMBOL_META_TTL_DAYS > 0 ? SYMBOL_META_TTL_DAYS : 30;
+  const expiresMs = t + ttlDays * 24 * 60 * 60 * 1000;
+  return new Date(expiresMs).toISOString();
+}
+
 function getAdmin(): SupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -74,7 +85,7 @@ export async function GET(req: Request) {
   // DB-only lookup (Phase 2 schema). No upstream calls here.
   const { data: scData, error: scError } = await supabase
     .from("symbol_classification")
-    .select("symbol, sector, industry, updated_at")
+    .select("symbol, sector, industry, industry_code, industry_abbrev, updated_at")
     .in("symbol", symbols);
 
   if (scError) {
@@ -116,21 +127,26 @@ export async function GET(req: Request) {
       sector: r.sector ?? null,
       sectorCode: computeSectorCode(r.sector ?? null),
       industry: r.industry ?? null,
-      industryCode: null,
-      industryAbbrev: null,
-      expiresAt: null,
+      industryCode: r.industry_code ?? null,
+      industryAbbrev: r.industry_abbrev ?? null,
+      expiresAt: computeExpiresAt(r.updated_at ?? null),
     };
   }
 
   // expose hydrate needs for the scheduler (no upstream calls here)
   const needsHydrate = symbols.filter((sym) => {
     const m = meta[sym];
-    return !m?.sector;
+    if (!m) return true;
+    if (!m.sector) return true;
+    if (!m.industry) return true;
+    if (isExpired(m.expiresAt)) return true;
+    return false;
   });
 
   return NextResponse.json({
     ok: true,
     meta,
-    ...(debug ? { debug: { needsHydrate, needsHydrateCount: needsHydrate.length } } : {}),
+    needsHydrateCount: needsHydrate.length,
+    ...(debug ? { debug: { needsHydrate } } : {}),
   });
 }

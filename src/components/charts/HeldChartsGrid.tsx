@@ -209,7 +209,7 @@ function MiniChartCard({ chartKey }: { chartKey: string }) {
               priceIn={priceIn}
               showSma50={instance.indicators.sma50}
               showSma200={instance.indicators.sma200}
-              onChartReady={setMiniChart}
+              onChartReady={(ctx: any) => setMiniChart(ctx?.chart ?? null)}
             />
             <IntradayFreshnessOverlay meta={meta} candlesCount={candles.length} />
           </div>

@@ -4,15 +4,14 @@ import type { WatchlistKey } from "@/lib/watchlists/local-watchlists";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   addWatchlistSymbol,
-  clearPriceIn as clearPriceInAction,
   createWatchlist,
-  getHoldingsMap,
   getWatchlistSymbols,
   reorderWatchlistSymbol,
   removeWatchlistSymbol,
-  setPriceIn,
   softDeleteWatchlist,
 } from "@/app/actions/holdings";
+import { realtimeState } from "@/lib/realtime/realtimeState";
+import { useRealtimeState } from "@/lib/realtime/useRealtimeState";
 import { useCandles } from "@/components/hooks/useCandles";
 import CandlesChart from "@/components/charts/CandlesChart";
 import { Sparkline1D } from "@/components/charts/Sparkline1D";
@@ -21,11 +20,9 @@ type RowVariant = "TRADE_LIST" | "SENTINEL";
 
 type WatchlistSymbolDTO = {
   symbol: string;
-  priceIn: number | null;
 };
 
 type TradeWatchlistKey = Exclude<WatchlistKey, "SENTINEL">;
-type HoldingsMap = Record<string, { priceIn: number | null }>;
 
 type SymbolMeta = {
   sector: string;
@@ -44,6 +41,7 @@ const SENTINEL_WATCH_ONLY_TOOLTIP =
 
 const CANONICAL_WATCHLIST_KEYS: WatchlistKey[] = [
   "SENTINEL",
+  "SAFE_HAVENS",
   "LAUNCH_LEADERS",
   "HIGH_VELOCITY_MULTIPLIERS",
   "SLOW_BURNERS",
@@ -130,6 +128,159 @@ function saveCustomWatchlistTitles(map: Record<string, string>) {
   }
 }
 
+type AfterHoursCandle = {
+  time: number; // epoch ms
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume?: number;
+};
+
+type LastSessionDerived = {
+  pctChange: number;
+  prevClose: number;
+  prevCloseDate: string; // YYYY-MM-DD in America/New_York
+  sparkline1d: number[];
+};
+
+const NY_TZ = "America/New_York";
+
+function etParts(nowUtc = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: NY_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(nowUtc);
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value;
+
+  return {
+    yyyy: Number(get("year")),
+    mm: Number(get("month")),
+    dd: Number(get("day")),
+    HH: Number(get("hour")),
+    MM: Number(get("minute")),
+    dow: new Intl.DateTimeFormat("en-US", { timeZone: NY_TZ, weekday: "short" })
+      .format(nowUtc)
+      .toUpperCase(),
+  };
+}
+
+// Convert an ET wall-clock to UTC (same idea as your server route).
+function etWallClockToUtcDate(y: number, m: number, d: number, h: number, min: number): Date {
+  const naive = new Date(Date.UTC(y, m - 1, d, h, min, 0, 0));
+
+  const etStr = new Intl.DateTimeFormat("en-US", {
+    timeZone: NY_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(naive);
+
+  const m2 = etStr.match(/^(\d{2})\/(\d{2})\/(\d{4}),\s(\d{2}):(\d{2}):(\d{2})$/);
+  if (!m2) return naive;
+
+  const em = Number(m2[1]);
+  const ed = Number(m2[2]);
+  const ey = Number(m2[3]);
+  const eh = Number(m2[4]);
+  const emin = Number(m2[5]);
+  const es = Number(m2[6]);
+
+  const asUtc = Date.UTC(ey, em - 1, ed, eh, emin, es);
+  const naiveMs = naive.getTime();
+  const offsetMs = naiveMs - asUtc;
+
+  return new Date(Date.UTC(y, m - 1, d, h, min, 0, 0) + offsetMs);
+}
+
+function isRegularSessionNow(nowUtc = new Date()): boolean {
+  // Regular session: 09:30–16:00 ET, Mon–Fri (holiday logic intentionally out of scope for v1).
+  const p = etParts(nowUtc);
+  const isWeekend = p.dow === "SAT" || p.dow === "SUN";
+  if (isWeekend) return false;
+
+  const minutes = p.HH * 60 + p.MM;
+  const start = 9 * 60 + 30;
+  const end = 16 * 60;
+  return minutes >= start && minutes <= end;
+}
+
+function lastRegularSessionWindowUtc(nowUtc = new Date()): { startIso: string; endIso: string; sessionDateEt: string } {
+  const p = etParts(nowUtc);
+  const minutes = p.HH * 60 + p.MM;
+  const beforeOpen = minutes < 9 * 60 + 30;
+
+  // Most recent weekday session date:
+  // - Sat -> Fri
+  // - Sun -> Fri
+  // - Mon before open -> Fri
+  let deltaDays = 0;
+  if (p.dow === "SAT") deltaDays = 1;
+  else if (p.dow === "SUN") deltaDays = 2;
+  else if (p.dow === "MON" && beforeOpen) deltaDays = 3;
+
+  const sessionUtcAnchor = new Date(nowUtc.getTime() - deltaDays * 24 * 60 * 60 * 1000);
+  const sp = etParts(sessionUtcAnchor);
+  const sessionDateEt = `${sp.yyyy}-${String(sp.mm).padStart(2, "0")}-${String(sp.dd).padStart(2, "0")}`;
+
+  const start = etWallClockToUtcDate(sp.yyyy, sp.mm, sp.dd, 9, 30);
+  const end = etWallClockToUtcDate(sp.yyyy, sp.mm, sp.dd, 16, 0);
+
+  return { startIso: start.toISOString(), endIso: end.toISOString(), sessionDateEt };
+}
+
+function deriveFromCandles(candles: AfterHoursCandle[], sessionDateDisplay: string): LastSessionDerived | null {
+  if (!Array.isArray(candles) || candles.length < 2) return null;
+
+  const first = candles[0];
+  const last = candles[candles.length - 1];
+  if (!first || !last) return null;
+
+  const base = first.open;
+  const end = last.close;
+  if (!Number.isFinite(base) || !Number.isFinite(end) || base <= 0) return null;
+
+  const pctChange = ((end / base) - 1) * 100;
+  const sparkline1d = candles
+    .map((c) => c.close)
+    .filter((x) => typeof x === "number" && Number.isFinite(x));
+
+  return {
+    pctChange,
+    prevClose: base,
+    prevCloseDate: sessionDateDisplay,
+    sparkline1d,
+  };
+}
+function formatSessionDateForDisplay(isoUtc: string, userTimeZone?: string): string {
+  try {
+    const d = new Date(isoUtc);
+    const tz = userTimeZone || NY_TZ;
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(d);
+
+    const get = (t: string) => parts.find((p) => p.type === t)?.value;
+    return `${get("year")}-${get("month")}-${get("day")}`;
+  } catch {
+    return isoUtc.slice(0, 10);
+  }
+}
+
 function SymbolRow({
   symbol,
   industryAbbrev,
@@ -138,8 +289,6 @@ function SymbolRow({
   onIntel,
   onSendToGrid,
   variant,
-  priceIn,
-  onEditPriceIn,
   showReorderControls,
   onMove,
   pctChange,
@@ -156,8 +305,6 @@ function SymbolRow({
   onIntel: () => void;
   onSendToGrid: () => void;
   variant: RowVariant;
-  priceIn: number | null;
-  onEditPriceIn: () => void;
   showReorderControls?: boolean;
   onMove?: (direction: "up" | "down") => void;
   pctChange?: number;
@@ -168,243 +315,159 @@ function SymbolRow({
   onRemove?: () => void;
 }) {
   return (
-    <div className="grid w-full grid-cols-[minmax(0,1fr)_96px_72px_auto_auto_auto_auto] items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-2">
-      {/* 1. Symbol + industry micro-pill */}
-      <div className="flex min-w-0 items-center gap-2">
-        <button
-          type="button"
-          onClick={onPromote}
-          className="min-w-0 truncate text-left text-xs font-medium text-neutral-200 hover:underline"
-          title={symbol}
-        >
-          {symbol}
-        </button>
-        {industryAbbrev ? (
-          <span
-            className="shrink-0 rounded-sm bg-neutral-900 px-1.5 py-0.5 text-[10px] text-neutral-300"
-            title={industry ? `Industry: ${industry}` : "Industry"}
-          >
-            {industryAbbrev}
-          </span>
-        ) : null}
-        {canRemove ? (
-          <button
-            type="button"
-            onClick={onRemove}
-            className="ml-auto inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
-            title="Remove from watchlist"
-            aria-label="Remove from watchlist"
-          >
-            ×
-          </button>
-        ) : null}
-      </div>
-
-      {/* 2. Sparkline */}
-      <div className="text-neutral-400">
-        <Sparkline1D
-          points={sparklinePoints ?? []}
-          baseline={typeof prevClose === "number" ? prevClose : undefined}
-          positive={
-            typeof prevClose === "number" && (sparklinePoints?.length ?? 0) > 0
-              ? (sparklinePoints as number[])[(sparklinePoints as number[]).length - 1] >= prevClose
-              : undefined
-          }
-        />
-      </div>
-
-      {/* 3-8: Actions and metrics, fixed columns */}
-      {variant === "TRADE_LIST" ? (
-        <>
-          {/* % change (fixed column) */}
-          <div className="flex justify-end">
-            {typeof pctChange === "number" ? (
-              <span
-                className={
-                  "rounded-full border px-2 py-0.5 text-[11px] " +
-                  (pctChange >= 0 ? "border-green-800 text-green-400" : "border-red-800 text-red-400")
-                }
-                title={
-                  "Day % (prev close → now)" +
-                  (typeof prevClose === "number" ? ` • Prev close: ${prevClose}` : "") +
-                  (prevCloseDate ? ` • Date: ${prevCloseDate}` : "")
-                }
-              >
-                {pctChange >= 0 ? "+" : ""}
-                {pctChange.toFixed(2)}%
-              </span>
-            ) : (
-              <span className="h-[22px]" />
-            )}
-          </div>
-
-          {/* IN @ */}
-          <button
-            type="button"
-            onClick={onEditPriceIn}
-            className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-[11px] text-neutral-200 hover:border-neutral-700"
-            title="Edit price-in"
-          >
-            {priceIn == null ? "IN @ —" : `IN @ ${priceIn}`}
-          </button>
-
-          {/* Intel */}
-          <button
-            type="button"
-            onClick={onIntel}
-            className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-[11px] text-neutral-200 hover:border-neutral-700"
-            title="Open Intel"
-          >
-            Intel
-          </button>
-
-          {/* Grid */}
-          <button
-            type="button"
-            onClick={onSendToGrid}
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
-            title="Send to Analysis Grid"
-            aria-label="Send to Analysis Grid"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width="14"
-              height="14"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <rect x="4" y="4" width="7" height="7" />
-              <rect x="13" y="4" width="7" height="7" />
-              <rect x="4" y="13" width="7" height="7" />
-              <rect x="13" y="13" width="7" height="7" />
-            </svg>
-          </button>
-
-          {/* Promote (last) */}
+    <div className="w-full rounded-md border border-neutral-800 bg-neutral-950 px-2 py-2">
+      <div className="grid w-full grid-cols-[minmax(0,1fr)_96px_72px_auto] grid-rows-2 gap-x-2 gap-y-2 items-start">
+        {/* Row 1, Col 1: Symbol + industry */}
+        <div className="row-start-1 col-start-1 flex min-w-0 items-center gap-2">
           <button
             type="button"
             onClick={onPromote}
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
-            title="Promote to Primary"
-            aria-label="Promote to Primary"
+            className="min-w-0 text-left text-xs font-medium !text-neutral-200 hover:underline"
+            title={symbol}
           >
-            <svg
-              viewBox="0 0 24 24"
-              width="14"
-              height="14"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M15 3h6v6" />
-              <path d="M10 14L21 3" />
-              <path d="M9 21H3v-6" />
-              <path d="M14 10L3 21" />
-            </svg>
+            <span className="whitespace-normal break-words">{symbol}</span>
           </button>
-        </>
-      ) : (
-        <>
-          {/* % change */}
-          <div className="flex justify-end">
-            {typeof pctChange === "number" ? (
-              <span
-                className={
-                  "rounded-full border px-2 py-0.5 text-[11px] " +
-                  (pctChange >= 0 ? "border-green-800 text-green-400" : "border-red-800 text-red-400")
-                }
-                title={
-                  "Day % (prev close → now)" +
-                  (typeof prevClose === "number" ? ` • Prev close: ${prevClose}` : "") +
-                  (prevCloseDate ? ` • Date: ${prevCloseDate}` : "")
-                }
+          {industryAbbrev ? (
+            <span
+              className="shrink-0 rounded-sm bg-neutral-900 px-1.5 py-0.5 text-[10px] text-neutral-300"
+              title={industry ? `Industry: ${industry}` : "Industry"}
+            >
+              {industryAbbrev}
+            </span>
+          ) : null}
+        </div>
+
+        {/* Row 1, Col 2: Sparkline */}
+        <div className="row-start-1 col-start-2 shrink-0 w-[96px] text-neutral-400">
+          <Sparkline1D
+            points={sparklinePoints ?? []}
+            baseline={typeof prevClose === "number" ? prevClose : undefined}
+            positive={
+              typeof prevClose === "number" && (sparklinePoints?.length ?? 0) > 0
+                ? (sparklinePoints as number[])[(sparklinePoints as number[]).length - 1] >= prevClose
+                : undefined
+            }
+          />
+        </div>
+
+        {/* Row 1, Col 3: % change */}
+        <div className="row-start-1 col-start-3 shrink-0 w-[72px] flex justify-end">
+          {typeof pctChange === "number" ? (
+            <span
+              className={
+                "rounded-full border px-2 py-0.5 text-[11px] " +
+                (pctChange >= 0 ? "border-green-800 text-green-400" : "border-red-800 text-red-400")
+              }
+              title={
+                "Day % (prev close → now)" +
+                (typeof prevClose === "number" ? ` • Prev close: ${prevClose}` : "") +
+                (prevCloseDate ? ` • Date: ${prevCloseDate}` : "")
+              }
+            >
+              {pctChange >= 0 ? "+" : ""}
+              {pctChange.toFixed(2)}%
+            </span>
+          ) : (
+            <span className="h-[22px]" />
+          )}
+        </div>
+
+        {/* Col 4: Controls. Row 1 aligns to sparkline/%change band; Row 2 sits directly underneath. */}
+        <div className="col-start-4 row-start-1 row-span-2 flex items-start justify-end">
+          <div className="grid grid-cols-2 gap-1 items-start">
+            {/* Row 1 controls: WATCH_ONLY (if sentinel) + Grid + Promote */}
+            {variant === "SENTINEL" ? (
+              <button
+                type="button"
+                className="col-span-2 justify-self-end rounded-full border border-neutral-800 bg-neutral-900 px-2 py-0.5 cursor-help text-[11px] text-neutral-200 hover:border-neutral-700"
+                title={SENTINEL_WATCH_ONLY_TOOLTIP}
               >
-                {pctChange >= 0 ? "+" : ""}
-                {pctChange.toFixed(2)}%
-              </span>
+                WATCH_ONLY
+              </button>
             ) : (
-              <span className="h-[22px]" />
+              // keep row height consistent even when not sentinel
+              <span className="col-span-2 h-0" />
+            )}
+
+            <button
+              type="button"
+              onClick={onSendToGrid}
+              className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
+              title="Send to Analysis Grid"
+              aria-label="Send to Analysis Grid"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="4" y="4" width="7" height="7" />
+                <rect x="13" y="4" width="7" height="7" />
+                <rect x="4" y="13" width="7" height="7" />
+                <rect x="13" y="13" width="7" height="7" />
+              </svg>
+            </button>
+
+            <button
+              type="button"
+              onClick={onPromote}
+              className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
+              title="Promote to Primary"
+              aria-label="Promote to Primary"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M15 3h6v6" />
+                <path d="M10 14L21 3" />
+                <path d="M9 21H3v-6" />
+                <path d="M14 10L3 21" />
+              </svg>
+            </button>
+
+            {/* Row 2 controls: Intel + Remove */}
+            <button
+              type="button"
+              onClick={onIntel}
+              className="rounded-md border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-[11px] text-neutral-200 hover:border-neutral-700"
+              title="Open Intel"
+            >
+              Intel
+            </button>
+
+            {canRemove ? (
+              <button
+                type="button"
+                onClick={onRemove}
+                className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
+                title="Remove from watchlist"
+                aria-label="Remove from watchlist"
+              >
+                ×
+              </button>
+            ) : (
+              <span className="h-6 w-6" />
             )}
           </div>
+        </div>
 
-          {/* Held slot uses WATCH_ONLY */}
-          <button
-            type="button"
-            className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-0.5 cursor-help text-[11px] text-neutral-200 hover:border-neutral-700"
-            title={SENTINEL_WATCH_ONLY_TOOLTIP}
-          >
-            WATCH_ONLY
-          </button>
-
-          {/* IN @ slot (blank for sentinel) */}
-          <span className="h-[22px]" />
-
-          {/* Intel */}
-          <button
-            type="button"
-            onClick={onIntel}
-            className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-[11px] text-neutral-200 hover:border-neutral-700"
-            title="Open Intel"
-          >
-            Intel
-          </button>
-
-          {/* Grid */}
-          <button
-            type="button"
-            onClick={onSendToGrid}
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
-            title="Send to Analysis Grid"
-            aria-label="Send to Analysis Grid"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width="14"
-              height="14"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <rect x="4" y="4" width="7" height="7" />
-              <rect x="13" y="4" width="7" height="7" />
-              <rect x="4" y="13" width="7" height="7" />
-              <rect x="13" y="13" width="7" height="7" />
-            </svg>
-          </button>
-
-          {/* Promote (last) */}
-          <button
-            type="button"
-            onClick={onPromote}
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 text-neutral-300 hover:border-neutral-700 hover:text-neutral-100"
-            title="Promote to Primary"
-            aria-label="Promote to Primary"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width="14"
-              height="14"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M15 3h6v6" />
-              <path d="M10 14L21 3" />
-              <path d="M9 21H3v-6" />
-              <path d="M14 10L3 21" />
-            </svg>
-          </button>
-        </>
-      )}
+        {/* Row 2 placeholders for columns 1-3 to enforce 2-row rhythm without shifting col 4 */}
+        <div className="row-start-2 col-start-1" />
+        <div className="row-start-2 col-start-2" />
+        <div className="row-start-2 col-start-3" />
+      </div>
     </div>
   );
 }
@@ -417,8 +480,6 @@ function WatchlistCard({
   watchlistKey,
   symbols,
   variant = "TRADE_LIST",
-  getSymbolState,
-  onEditPriceIn,
   onIntel,
   canAdd,
   onRequestAdd,
@@ -435,14 +496,14 @@ function WatchlistCard({
   onUpdateSectorOrder,
   onRemoveSymbol,
   onDeleteWatchlist,
+  regularSession,
+  lastSessionBySymbol,
 }: {
   title: string;
   subtitle: string;
   watchlistKey: string;
   symbols: string[];
   variant?: RowVariant;
-  getSymbolState: (symbol: string) => { priceIn: number | null };
-  onEditPriceIn: (symbol: string) => void;
   onIntel: (symbol: string) => void;
   canAdd?: boolean;
   onRequestAdd?: () => void;
@@ -461,6 +522,8 @@ function WatchlistCard({
   onUpdateSectorOrder?: (nextOrder: string[]) => void;
   onRemoveSymbol?: (symbol: string) => void;
   onDeleteWatchlist?: () => void;
+  regularSession: boolean;
+  lastSessionBySymbol: Record<string, LastSessionDerived>;
 }) {
   // V1 single-user: watchlist composites require ownerUserId to populate per-symbol meta (pctChange/sparkline).
   const OWNER_USER_ID = process.env.NEXT_PUBLIC_DEV_OWNER_USER_ID;
@@ -485,6 +548,17 @@ function WatchlistCard({
     },
   });
 
+  // Read live ticks for the current card's symbols.
+  const liveBySymbol = useRealtimeState((s) => {
+    const map: Record<string, { price?: number; ts?: number } | null> = {};
+    for (const symRaw of symbols) {
+      const sym = String(symRaw).trim().toUpperCase();
+      if (!sym) continue;
+      map[sym] = (s.lastTickBySymbol as any)?.[sym] ?? null;
+    }
+    return map;
+  });
+
   const compositePctChange = useMemo(() => {
     if (!compositeCandles || compositeCandles.length < 2) return null;
     const first = compositeCandles[0]?.close;
@@ -494,11 +568,8 @@ function WatchlistCard({
   }, [compositeCandles]);
 
   const rows: WatchlistSymbolDTO[] = useMemo(() => {
-    return symbols.map((symbol) => {
-      const st = getSymbolState(symbol);
-      return { symbol, priceIn: st.priceIn };
-    });
-  }, [getSymbolState, symbols]);
+    return symbols.map((symbol) => ({ symbol }));
+  }, [symbols]);
 
   const rowsBySector = useMemo(() => {
     const m: Record<string, WatchlistSymbolDTO[]> = {};
@@ -716,64 +787,92 @@ function WatchlistCard({
           {/* SENTINEL: keep flat list (no sector grouping) */}
           {variant === "SENTINEL" ? (
             <div className="space-y-2">
-          {rows.map((row) => {
-            const meta = symbolMetaBySymbol[row.symbol.toUpperCase()];
-            return (
-              <SymbolRow
-                key={row.symbol}
-                symbol={row.symbol}
-                canRemove
-                onRemove={() => onRemoveSymbol?.(row.symbol)}
-                industry={meta?.industry ?? null}
-                industryAbbrev={meta?.industryAbbrev ?? null}
-                variant={variant}
-                priceIn={row.priceIn}
-                onPromote={() => {
-                  const id =
-                    (globalThis.crypto as any)?.randomUUID?.() ||
-                    `chart-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-                  window.dispatchEvent(
-                    new CustomEvent("tp:modal:open", {
-                      detail: {
-                        id,
-                        type: "chart",
-                        title: row.symbol,
-                        position: { x: 120, y: 120 },
-                        size: { w: 720, h: 520 },
-                        state: {
-                          target: { type: "SYMBOL", symbol: row.symbol },
-                          range: "1D",
-                          resolution: "5m",
-                          indicators: {
-                            rsi: true,
-                            macd: true,
-                            sma50: false,
-                            sma200: false,
+              {rows.map((row) => {
+                const meta = symbolMetaBySymbol[row.symbol.toUpperCase()];
+                return (
+                  <SymbolRow
+                    key={row.symbol}
+                    symbol={row.symbol}
+                    canRemove
+                    onRemove={() => onRemoveSymbol?.(row.symbol)}
+                    industry={meta?.industry ?? null}
+                    industryAbbrev={meta?.industryAbbrev ?? null}
+                    variant={variant}
+                    onPromote={() => {
+                      const id =
+                        (globalThis.crypto as any)?.randomUUID?.() ||
+                        `chart-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+                      window.dispatchEvent(
+                        new CustomEvent("tp:modal:open", {
+                          detail: {
+                            id,
+                            type: "chart",
+                            title: row.symbol,
+                            position: { x: 120, y: 120 },
+                            size: { w: 720, h: 520 },
+                            state: {
+                              target: { type: "SYMBOL", symbol: row.symbol },
+                              range: "1D",
+                              resolution: "5m",
+                              indicators: {
+                                rsi: true,
+                                macd: true,
+                                sma50: false,
+                                sma200: false,
+                              },
+                              source: "watchlistRow",
+                            },
                           },
-                          source: "watchlistRow",
-                        },
-                      },
-                    })
-                  );
-                }}
-                showReorderControls={false}
-                onMove={undefined}
-                onIntel={() => onIntel(row.symbol)}
-                onSendToGrid={() => {
-                  window.dispatchEvent(
-                    new CustomEvent("tp:analysisGrid:addSymbols", {
-                      detail: { symbols: [row.symbol] },
-                    })
-                  );
-                }}
-                onEditPriceIn={() => onEditPriceIn(row.symbol)}
-                pctChange={compositeMeta?.constituents?.[row.symbol]?.pctChange}
-                prevClose={compositeMeta?.constituents?.[row.symbol]?.prevClose}
-                prevCloseDate={compositeMeta?.constituents?.[row.symbol]?.prevCloseDate}
-                sparklinePoints={compositeMeta?.constituents?.[row.symbol]?.sparkline1d}
-              />
-            );
-          })}
+                        })
+                      );
+                    }}
+                    showReorderControls={false}
+                    onMove={undefined}
+                    onIntel={() => onIntel(row.symbol)}
+                    onSendToGrid={() => {
+                      window.dispatchEvent(
+                        new CustomEvent("tp:analysisGrid:addSymbols", {
+                          detail: { symbols: [row.symbol] },
+                        })
+                      );
+                    }}
+                    pctChange={(() => {
+                      const sym = row.symbol.toUpperCase();
+                      const live = liveBySymbol?.[sym] ?? null;
+                      const livePrice = live && typeof (live as any).price === "number" ? (live as any).price : null;
+
+                      const prevCloseFromComposite = (compositeMeta as any)?.constituents?.[row.symbol]?.prevClose;
+                      const prevCloseFromLastSession = lastSessionBySymbol[sym]?.prevClose;
+                      const prevCloseBase =
+                        typeof prevCloseFromComposite === "number" ? prevCloseFromComposite : prevCloseFromLastSession;
+
+                      if (typeof prevCloseBase === "number" && prevCloseBase > 0 && typeof livePrice === "number") {
+                        return ((livePrice / prevCloseBase) - 1) * 100;
+                      }
+
+                      const pctFromComposite = (compositeMeta as any)?.constituents?.[row.symbol]?.pctChange;
+                      const pctFromLastSession = lastSessionBySymbol[sym]?.pctChange;
+
+                      return typeof pctFromComposite === "number" ? pctFromComposite : pctFromLastSession;
+                    })()}
+                    prevClose={
+                      regularSession
+                        ? (compositeMeta as any)?.constituents?.[row.symbol]?.prevClose
+                        : lastSessionBySymbol[row.symbol.toUpperCase()]?.prevClose
+                    }
+                    prevCloseDate={
+                      regularSession
+                        ? (compositeMeta as any)?.constituents?.[row.symbol]?.prevCloseDate
+                        : lastSessionBySymbol[row.symbol.toUpperCase()]?.prevCloseDate
+                    }
+                    sparklinePoints={
+                      regularSession
+                        ? (compositeMeta as any)?.constituents?.[row.symbol]?.sparkline1d
+                        : lastSessionBySymbol[row.symbol.toUpperCase()]?.sparkline1d
+                    }
+                  />
+                );
+              })}
             </div>
           ) : (
             <div className="space-y-3">
@@ -823,7 +922,6 @@ function WatchlistCard({
                             industry={meta?.industry ?? null}
                             industryAbbrev={meta?.industryAbbrev ?? null}
                             variant={variant}
-                            priceIn={row.priceIn}
                             onPromote={() => {
                               const id =
                                 (globalThis.crypto as any)?.randomUUID?.() ||
@@ -862,11 +960,39 @@ function WatchlistCard({
                                 })
                               );
                             }}
-                            onEditPriceIn={() => onEditPriceIn(row.symbol)}
-                            pctChange={compositeMeta?.constituents?.[row.symbol]?.pctChange}
-                            prevClose={compositeMeta?.constituents?.[row.symbol]?.prevClose}
-                            prevCloseDate={compositeMeta?.constituents?.[row.symbol]?.prevCloseDate}
-                            sparklinePoints={compositeMeta?.constituents?.[row.symbol]?.sparkline1d}
+                            pctChange={(() => {
+                              const sym = row.symbol.toUpperCase();
+                              const live = liveBySymbol?.[sym] ?? null;
+                              const livePrice = live && typeof (live as any).price === "number" ? (live as any).price : null;
+
+                              const prevCloseBase = regularSession
+                                ? (compositeMeta as any)?.constituents?.[row.symbol]?.prevClose
+                                : lastSessionBySymbol[sym]?.prevClose;
+
+                              if (typeof prevCloseBase === "number" && prevCloseBase > 0 && typeof livePrice === "number") {
+                                return ((livePrice / prevCloseBase) - 1) * 100;
+                              }
+
+                              // Fallback to derived pctChange when live ticks aren't available (e.g. premarket, stale provider).
+                              return regularSession
+                                ? (compositeMeta as any)?.constituents?.[row.symbol]?.pctChange
+                                : lastSessionBySymbol[sym]?.pctChange;
+                            })()}
+                            prevClose={
+                              regularSession
+                                ? (compositeMeta as any)?.constituents?.[row.symbol]?.prevClose
+                                : lastSessionBySymbol[row.symbol.toUpperCase()]?.prevClose
+                            }
+                            prevCloseDate={
+                              regularSession
+                                ? (compositeMeta as any)?.constituents?.[row.symbol]?.prevCloseDate
+                                : lastSessionBySymbol[row.symbol.toUpperCase()]?.prevCloseDate
+                            }
+                            sparklinePoints={
+                              regularSession
+                                ? (compositeMeta as any)?.constituents?.[row.symbol]?.sparkline1d
+                                : lastSessionBySymbol[row.symbol.toUpperCase()]?.sparkline1d
+                            }
                           />
                         );
                       })}
@@ -886,16 +1012,12 @@ export default function WatchlistsPanel() {
   const [intelOpen, setIntelOpen] = useState(false);
   const [intelSymbol, setIntelSymbol] = useState<string | null>(null);
 
-  const [priceInBySymbol, setPriceInBySymbol] = useState<Record<string, number | null>>({});
-
-  const [priceInEditorOpen, setPriceInEditorOpen] = useState(false);
-  const [priceInEditorSymbol, setPriceInEditorSymbol] = useState<string | null>(null);
-  const [priceInEditorValue, setPriceInEditorValue] = useState<string>("");
 
   const OWNER_USER_ID = process.env.NEXT_PUBLIC_DEV_OWNER_USER_ID;
 
   const [symbolsByWatchlistKey, setSymbolsByWatchlistKey] = useState<Record<string, string[]>>(() => ({
     SENTINEL: [],
+    SAFE_HAVENS: [],
     LAUNCH_LEADERS: [],
     HIGH_VELOCITY_MULTIPLIERS: [],
     SLOW_BURNERS: [],
@@ -908,6 +1030,17 @@ export default function WatchlistsPanel() {
   const [customWatchlistTitles, setCustomWatchlistTitles] = useState<Record<string, string>>({});
   const [newWatchlistOpen, setNewWatchlistOpen] = useState(false);
   const [newWatchlistValue, setNewWatchlistValue] = useState("");
+
+  const [lastSessionBySymbol, setLastSessionBySymbol] = useState<Record<string, LastSessionDerived>>({});
+
+  const [regularSession, setRegularSession] = useState<boolean>(() => isRegularSessionNow(new Date()));
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setRegularSession(isRegularSessionNow(new Date()));
+    }, 30_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   const fetchSymbolMeta = useCallback(async (symbols: string[]) => {
     const uniq = Array.from(new Set(symbols.map((s) => s.trim().toUpperCase()).filter(Boolean)));
@@ -997,6 +1130,7 @@ export default function WatchlistsPanel() {
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => ({
     SENTINEL: false,
+    SAFE_HAVENS: false,
     LAUNCH_LEADERS: false,
     HIGH_VELOCITY_MULTIPLIERS: false,
     SLOW_BURNERS: false,
@@ -1008,6 +1142,7 @@ export default function WatchlistsPanel() {
 
   const [reorderMode, setReorderMode] = useState<Record<string, boolean>>(() => ({
     SENTINEL: false,
+    SAFE_HAVENS: false,
     LAUNCH_LEADERS: false,
     HIGH_VELOCITY_MULTIPLIERS: false,
     SLOW_BURNERS: false,
@@ -1078,31 +1213,6 @@ export default function WatchlistsPanel() {
     }
   };
 
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      try {
-        if (!OWNER_USER_ID) return;
-        const map = (await getHoldingsMap(OWNER_USER_ID)) as HoldingsMap;
-        if (cancelled) return;
-
-        const nextPrice: Record<string, number | null> = {};
-
-        for (const [symbol, st] of Object.entries(map)) {
-          nextPrice[symbol] = st.priceIn;
-        }
-
-        setPriceInBySymbol(nextPrice);
-      } catch {
-        // fail-silent (v1)
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [OWNER_USER_ID]);
 
   useEffect(() => {
     try {
@@ -1188,11 +1298,107 @@ export default function WatchlistsPanel() {
     fetchSymbolMeta(all);
   }, [symbolsByWatchlistKey, fetchSymbolMeta]);
 
+  // Subscribe view-symbols for live ticks for all watchlists
+  useEffect(() => {
+    const viewId = "watchlists-panel";
+
+    const all: string[] = [];
+    for (const syms of Object.values(symbolsByWatchlistKey)) {
+      for (const s of syms) {
+        const sym = String(s ?? "").trim().toUpperCase();
+        if (sym) all.push(sym);
+      }
+    }
+
+    const uniq = Array.from(new Set(all));
+
+    if (uniq.length > 0) {
+      realtimeState.setViewSymbols(viewId, uniq);
+    } else {
+      realtimeState.clearViewSymbols(viewId);
+    }
+
+    return () => {
+      realtimeState.clearViewSymbols(viewId);
+    };
+  }, [symbolsByWatchlistKey]);
+
+  useEffect(() => {
+    const all: string[] = [];
+    for (const syms of Object.values(symbolsByWatchlistKey)) {
+      for (const s of syms) all.push(String(s ?? "").trim().toUpperCase());
+    }
+    const uniq = Array.from(new Set(all.filter(Boolean)));
+    if (uniq.length === 0) return;
+
+    // Skip if we already have baselines for all of them
+    const missing = uniq.filter((s) => !lastSessionBySymbol[s]?.prevClose);
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+
+    (async () => {
+      const { startIso, endIso } = lastRegularSessionWindowUtc(new Date());
+      const sessionDateDisplay = formatSessionDateForDisplay(startIso, (window as any)?.tpPreferences?.timeZone);
+
+      try {
+        const results = await Promise.all(
+          missing.map(async (sym) => {
+            try {
+              const url = new URL("/api/market/candles/window", window.location.origin);
+              url.searchParams.set("target", "SYMBOL");
+              url.searchParams.set("symbol", sym);
+              url.searchParams.set("range", "1D");
+              url.searchParams.set("res", "5m");
+              url.searchParams.set("session", "regular");
+
+              const res = await fetch(url.toString(), { cache: "no-store" });
+              if (!res.ok) return [sym, null] as const;
+
+              const json = await res.json();
+              const candles = (json?.candles ?? []) as AfterHoursCandle[];
+              const derived = deriveFromCandles(candles, sessionDateDisplay);
+              return [sym, derived] as const;
+            } catch {
+              return [sym, null] as const;
+            }
+          })
+        );
+
+        if (cancelled) return;
+
+        setLastSessionBySymbol((prev) => {
+          let changed = false;
+          const next = { ...prev };
+
+          for (const [sym, derived] of results) {
+            if (!derived) continue;
+
+            const existing = prev[sym];
+            if (!existing || existing.prevClose !== derived.prevClose || existing.pctChange !== derived.pctChange) {
+              next[sym] = derived;
+              changed = true;
+            }
+          }
+
+          return changed ? next : prev;
+        });
+      } catch {
+        // silent
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [symbolsByWatchlistKey, lastSessionBySymbol]);
+
   // hydrate sector order (trade watchlists + custom watchlists)
   useEffect(() => {
     if (!OWNER_USER_ID) return;
 
     const keys: string[] = [
+      "SAFE_HAVENS",
       "LAUNCH_LEADERS",
       "HIGH_VELOCITY_MULTIPLIERS",
       "SLOW_BURNERS",
@@ -1202,54 +1408,9 @@ export default function WatchlistsPanel() {
     for (const k of keys) fetchSectorOrder(k);
   }, [OWNER_USER_ID, fetchSectorOrder, customWatchlistKeys]);
 
-  const getSymbolState = (symbol: string) => ({
-    priceIn: Object.prototype.hasOwnProperty.call(priceInBySymbol, symbol) ? priceInBySymbol[symbol] ?? null : null,
-  });
-
   const openIntel = (symbol: string) => {
     setIntelSymbol(symbol);
     setIntelOpen(true);
-  };
-
-  const editPriceIn = (symbol: string) => {
-    const current = priceInBySymbol[symbol] ?? null;
-    setPriceInEditorSymbol(symbol);
-    setPriceInEditorValue(current == null ? "" : String(current));
-    setPriceInEditorOpen(true);
-  };
-
-  const closePriceInEditor = () => {
-    setPriceInEditorOpen(false);
-    setPriceInEditorSymbol(null);
-    setPriceInEditorValue("");
-  };
-
-  const commitPriceIn = async () => {
-    if (!priceInEditorSymbol) return;
-    const trimmed = priceInEditorValue.trim();
-    if (trimmed === "") return;
-    const next = Number(trimmed);
-    if (!Number.isFinite(next)) return;
-
-    setPriceInBySymbol((prev) => ({ ...prev, [priceInEditorSymbol]: next }));
-    if (OWNER_USER_ID) {
-      try {
-        await setPriceIn(OWNER_USER_ID, priceInEditorSymbol, next);
-      } catch {}
-    }
-    closePriceInEditor();
-  };
-
-  const clearPriceIn = async () => {
-    if (!priceInEditorSymbol) return;
-
-    setPriceInBySymbol((prev) => ({ ...prev, [priceInEditorSymbol]: null }));
-    if (OWNER_USER_ID) {
-      try {
-        await clearPriceInAction(OWNER_USER_ID, priceInEditorSymbol);
-      } catch {}
-    }
-    closePriceInEditor();
   };
 
 
@@ -1446,8 +1607,6 @@ export default function WatchlistsPanel() {
           watchlistKey="SENTINEL"
           variant="SENTINEL"
           symbols={symbolsByWatchlistKey["SENTINEL"] ?? []}
-          getSymbolState={getSymbolState}
-          onEditPriceIn={() => {}}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("SENTINEL")}
@@ -1463,6 +1622,34 @@ export default function WatchlistsPanel() {
           onMoveSymbol={(symbol, direction) => moveSymbol("SENTINEL", symbol, direction)}
           symbolMetaBySymbol={symbolMetaBySymbol}
           onRemoveSymbol={(symbol) => removeSymbolLocal("SENTINEL", symbol)}
+          regularSession={regularSession}
+          lastSessionBySymbol={lastSessionBySymbol}
+        />
+
+        <WatchlistCard
+          title="Safe Havens"
+          subtitle="Defensive / ballast names (tracking)"
+          watchlistKey="SAFE_HAVENS"
+          symbols={symbolsByWatchlistKey["SAFE_HAVENS"] ?? []}
+          onIntel={openIntel}
+          canAdd
+          onRequestAdd={() => openAdd("SAFE_HAVENS")}
+          addOpen={addOpenKey === "SAFE_HAVENS"}
+          addValue={addValue}
+          onChangeAddValue={setAddValue}
+          onCommitAdd={() => commitAdd("SAFE_HAVENS")}
+          onCancelAdd={cancelAdd}
+          collapsed={Boolean(collapsed["SAFE_HAVENS"])}
+          onToggleCollapsed={() => toggleCollapsed("SAFE_HAVENS")}
+          reorderMode={Boolean(reorderMode["SAFE_HAVENS"])}
+          onToggleReorderMode={() => toggleReorderMode("SAFE_HAVENS")}
+          onMoveSymbol={(symbol, direction) => moveSymbol("SAFE_HAVENS", symbol, direction)}
+          symbolMetaBySymbol={symbolMetaBySymbol}
+          sectorOrder={sectorOrderByWatchlistKey["SAFE_HAVENS"]}
+          onUpdateSectorOrder={(next) => saveSectorOrder("SAFE_HAVENS", next)}
+          onRemoveSymbol={(symbol) => removeSymbolLocal("SAFE_HAVENS", symbol)}
+          regularSession={regularSession}
+          lastSessionBySymbol={lastSessionBySymbol}
         />
 
         <WatchlistCard
@@ -1470,8 +1657,6 @@ export default function WatchlistsPanel() {
           subtitle="High-impulse breakouts (tracking)"
           watchlistKey="LAUNCH_LEADERS"
           symbols={symbolsByWatchlistKey["LAUNCH_LEADERS"] ?? []}
-          getSymbolState={getSymbolState}
-          onEditPriceIn={editPriceIn}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("LAUNCH_LEADERS")}
@@ -1489,6 +1674,8 @@ export default function WatchlistsPanel() {
           sectorOrder={sectorOrderByWatchlistKey["LAUNCH_LEADERS"]}
           onUpdateSectorOrder={(next) => saveSectorOrder("LAUNCH_LEADERS", next)}
           onRemoveSymbol={(symbol) => removeSymbolLocal("LAUNCH_LEADERS", symbol)}
+          regularSession={regularSession}
+          lastSessionBySymbol={lastSessionBySymbol}
         />
 
         <WatchlistCard
@@ -1496,8 +1683,6 @@ export default function WatchlistsPanel() {
           subtitle="Momentum continuation / expansion"
           watchlistKey="HIGH_VELOCITY_MULTIPLIERS"
           symbols={symbolsByWatchlistKey["HIGH_VELOCITY_MULTIPLIERS"] ?? []}
-          getSymbolState={getSymbolState}
-          onEditPriceIn={editPriceIn}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("HIGH_VELOCITY_MULTIPLIERS")}
@@ -1515,6 +1700,8 @@ export default function WatchlistsPanel() {
           sectorOrder={sectorOrderByWatchlistKey["HIGH_VELOCITY_MULTIPLIERS"]}
           onUpdateSectorOrder={(next) => saveSectorOrder("HIGH_VELOCITY_MULTIPLIERS", next)}
           onRemoveSymbol={(symbol) => removeSymbolLocal("HIGH_VELOCITY_MULTIPLIERS", symbol)}
+          regularSession={regularSession}
+          lastSessionBySymbol={lastSessionBySymbol}
         />
 
         <WatchlistCard
@@ -1522,8 +1709,6 @@ export default function WatchlistsPanel() {
           subtitle="Gradual trend builders"
           watchlistKey="SLOW_BURNERS"
           symbols={symbolsByWatchlistKey["SLOW_BURNERS"] ?? []}
-          getSymbolState={getSymbolState}
-          onEditPriceIn={editPriceIn}
           onIntel={openIntel}
           canAdd
           onRequestAdd={() => openAdd("SLOW_BURNERS")}
@@ -1541,6 +1726,8 @@ export default function WatchlistsPanel() {
           sectorOrder={sectorOrderByWatchlistKey["SLOW_BURNERS"]}
           onUpdateSectorOrder={(next) => saveSectorOrder("SLOW_BURNERS", next)}
           onRemoveSymbol={(symbol) => removeSymbolLocal("SLOW_BURNERS", symbol)}
+          regularSession={regularSession}
+          lastSessionBySymbol={lastSessionBySymbol}
         />
 
         {customWatchlistKeys.length > 0 ? (
@@ -1554,8 +1741,6 @@ export default function WatchlistsPanel() {
                   subtitle="Custom watchlist"
                   watchlistKey={k}
                   symbols={symbolsByWatchlistKey[k] ?? []}
-                  getSymbolState={getSymbolState}
-                  onEditPriceIn={editPriceIn}
                   onIntel={openIntel}
                   canAdd
                   onRequestAdd={() => openAdd(k)}
@@ -1574,6 +1759,8 @@ export default function WatchlistsPanel() {
                   onUpdateSectorOrder={(next) => saveSectorOrder(k, next)}
                   onRemoveSymbol={(symbol) => removeSymbolLocal(k, symbol)}
                   onDeleteWatchlist={() => deleteWatchlistLocal(k)}
+                  regularSession={regularSession}
+                  lastSessionBySymbol={lastSessionBySymbol}
                 />
               ))}
             </div>
@@ -1600,59 +1787,6 @@ export default function WatchlistsPanel() {
         </div>
       )}
 
-      {priceInEditorOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-950 p-4">
-            <div className="flex items-center justify-between">
-              <div className="text-sm font-medium">Price-in: {priceInEditorSymbol}</div>
-              <button type="button" className="text-xs text-neutral-400 hover:text-neutral-200" onClick={closePriceInEditor}>
-                Close
-              </button>
-            </div>
-
-            <div className="mt-3">
-              <label className="mb-1 block text-xs text-neutral-500">Entry price</label>
-              <input
-                type="number"
-                inputMode="decimal"
-                step="any"
-                value={priceInEditorValue}
-                onChange={(e) => setPriceInEditorValue(e.target.value)}
-                className="w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 outline-none focus:border-neutral-700"
-                placeholder="e.g., 123.45"
-              />
-            </div>
-
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={clearPriceIn}
-                className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-xs text-neutral-200 hover:border-neutral-700"
-              >
-                Clear
-              </button>
-              <button
-                type="button"
-                onClick={commitPriceIn}
-                className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-xs text-neutral-200 hover:border-neutral-700"
-              >
-                Set
-              </button>
-              <button
-                type="button"
-                onClick={closePriceInEditor}
-                className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-xs text-neutral-200 hover:border-neutral-700"
-              >
-                Cancel
-              </button>
-            </div>
-
-            <div className="mt-3 text-xs text-neutral-500">
-              Set commits explicitly; blank values are not accepted. Use Clear to remove.
-            </div>
-          </div>
-        </div>
-      )}
     </section>
   );
 }

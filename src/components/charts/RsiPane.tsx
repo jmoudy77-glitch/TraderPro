@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   createChart,
   LineSeries,
@@ -42,6 +42,13 @@ function applyVisibleWindow(
   chart.timeScale().setVisibleLogicalRange({ from, to });
 }
 
+function toUTCTimestamp(t: number): UTCTimestamp {
+  // If t looks like milliseconds since epoch, convert to seconds.
+  // Otherwise assume it's already seconds.
+  const seconds = t > 20_000_000_000 ? Math.floor(t / 1000) : Math.floor(t);
+  return seconds as UTCTimestamp;
+}
+
 export default function RsiPane({
   candles,
   activeTime,
@@ -57,10 +64,25 @@ export default function RsiPane({
   const rsiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const line30Ref = useRef<ISeriesApi<"Line"> | null>(null);
   const line70Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const anchorSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const rsiLabelRef = useRef<any>(null);
+
+  const isHoveringRef = useRef(false);
+
+  const [rsiOverlay, setRsiOverlay] = useState<{ y: number; text: string } | null>(null);
 
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
 
   const normalizedCandles = useMemo(() => normalizeCandles(candles), [candles]);
+
+  const anchorLine = useMemo(
+    () =>
+      normalizedCandles.map((c) => ({
+        time: toUTCTimestamp(Number(c.time)),
+        value: 50,
+      })) as LineData<UTCTimestamp>[],
+    [normalizedCandles]
+  );
 
   const rsiData = useMemo(() => {
     const points = computeRsi(normalizedCandles, 14);
@@ -115,58 +137,87 @@ export default function RsiPane({
       layout: {
         background: { type: ColorType.Solid, color: "#0a0a0a" },
         textColor: "#a3a3a3",
+        attributionLogo: false,
         },
         rightPriceScale: {
         borderVisible: false,
         autoScale: true, // we’ll force RSI range via autoscaleInfoProvider
-        scaleMargins: { top: 0.15, bottom: 0.15 },
-        },
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+      },
 
-        // 🔒 Disable independent interaction
-        handleScroll: false,
-        handleScale: false,
-        
-        timeScale: {
-        visible: timeScaleVisible,
-        borderVisible: false,
-        timeVisible: true,
-        secondsVisible: false,
-    },
+      // 🔒 Disable independent interaction
+      handleScroll: false,
+      handleScale: false,
+      
+      timeScale: {
+      visible: timeScaleVisible,
+      borderVisible: false,
+      timeVisible: true,
+      secondsVisible: false,
+  },
       grid: {
         vertLines: { visible: false },
-        horzLines: { visible: true },
+        horzLines: { visible: false },
       },
       crosshair: {
         vertLine: { visible: true },
-        horzLine: { visible: true },
+        horzLine: { visible: false },
       },
     });
 
     chartRef.current = chart;
     onChartReady?.(chart);
 
+    const anchor = chart.addSeries(LineSeries, {
+      lineWidth: 1,
+      priceScaleId: "right",
+      color: "rgba(0,0,0,0)",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+
     const rsi = chart.addSeries(LineSeries, {
         lineWidth: 2,
         priceScaleId: "right",
+        priceLineVisible: false,
+        lastValueVisible: false,
         autoscaleInfoProvider: () => ({
             priceRange: { minValue: 0, maxValue: 100 },
         }),
     });
 
-    const l30 = chart.addSeries(LineSeries, {
-        lineWidth: 1,
-        priceScaleId: "right",
-        lineStyle: 2,
-        color: "rgba(255,255,255,0.25)",
-        });
-
-        const l70 = chart.addSeries(LineSeries, {
-        lineWidth: 1,
-        priceScaleId: "right",
-        lineStyle: 2,
-        color: "rgba(255,255,255,0.25)",
+    // Label-only right-scale RSI value (no horizontal line). Updated on crosshair move.
+    rsiLabelRef.current = (rsi as any).createPriceLine?.({
+      price: 50,
+      color: "rgba(229,229,229,0.85)",
+      lineWidth: 1,
+      axisLabelVisible: false,
+      lineVisible: false,
+      title: "RSI",
     });
 
+    const l30 = chart.addSeries(LineSeries, {
+      lineWidth: 1,
+      priceScaleId: "right",
+      lineStyle: 2,
+      color: "rgba(255,255,255,0.25)",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+
+    const l70 = chart.addSeries(LineSeries, {
+      lineWidth: 1,
+      priceScaleId: "right",
+      lineStyle: 2,
+      color: "rgba(255,255,255,0.25)",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+
+    anchorSeriesRef.current = anchor;
     rsiSeriesRef.current = rsi;
     line30Ref.current = l30;
     line70Ref.current = l70;
@@ -199,6 +250,8 @@ export default function RsiPane({
 
       chart.remove();
       chartRef.current = null;
+      rsiLabelRef.current = null;
+      anchorSeriesRef.current = null;
       rsiSeriesRef.current = null;
       line30Ref.current = null;
       line70Ref.current = null;
@@ -232,23 +285,116 @@ export default function RsiPane({
     };
     }, [syncChart]);
 
+  // Crosshair sync (mirror primary chart hover) + right-scale value label
+  useEffect(() => {
+    const destChart = chartRef.current;
+    const anchor = anchorSeriesRef.current;
+    if (!destChart || !syncChart || !anchor) return;
+
+    const handler = (param: any) => {
+      try {
+        const t = param?.time;
+        if (t != null) {
+          isHoveringRef.current = true;
+          (destChart as any).setCrosshairPosition?.(50, t, anchor as any);
+
+          const rv = rsiByTime.get(t as any);
+          if (typeof rv === "number") {
+            try {
+              const y = (rsiSeriesRef.current as any)?.priceToCoordinate?.(rv);
+              if (typeof y === "number" && Number.isFinite(y)) {
+                setRsiOverlay({ y, text: rv.toFixed(2) });
+              }
+            } catch {
+              // ignore
+            }
+          }
+        } else {
+          isHoveringRef.current = false;
+          (destChart as any).clearCrosshairPosition?.();
+
+          if (typeof lastRsi === "number") {
+            try {
+              const y = (rsiSeriesRef.current as any)?.priceToCoordinate?.(lastRsi);
+              if (typeof y === "number" && Number.isFinite(y)) {
+                setRsiOverlay({ y, text: lastRsi.toFixed(2) });
+              } else {
+                setRsiOverlay(null);
+              }
+            } catch {
+              setRsiOverlay(null);
+            }
+          } else {
+            setRsiOverlay(null);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    (syncChart as any).subscribeCrosshairMove?.(handler);
+
+    return () => {
+      try {
+        (syncChart as any).unsubscribeCrosshairMove?.(handler);
+      } catch {
+        // ignore
+      }
+      try {
+        (destChart as any).clearCrosshairPosition?.();
+      } catch {
+        // ignore
+      }
+      try {
+        isHoveringRef.current = false;
+        setRsiOverlay(null);
+      } catch {
+        // ignore
+      }
+    };
+  }, [syncChart, rsiByTime, lastRsi]);
+
   // Update data when candles change
   useEffect(() => {
     const chart = chartRef.current;
+    const anchor = anchorSeriesRef.current;
     const rsi = rsiSeriesRef.current;
     const l30 = line30Ref.current;
     const l70 = line70Ref.current;
-    if (!chart || !rsi || !l30 || !l70) return;
+    if (!chart || !anchor || !rsi || !l30 || !l70) return;
+
+    anchor.setData(anchorLine);
 
     rsi.setData(rsiData);
     l30.setData(guide30);
     l70.setData(guide70);
 
+    // Default the right-scale RSI label to the last value when not hovering.
+    if (typeof lastRsi === "number") {
+      try {
+        rsiLabelRef.current?.applyOptions?.({ price: lastRsi });
+      } catch {
+        // ignore
+      }
+    }
+    // Keep the overlay showing the current RSI when not hovering (and re-compute Y after rescale).
+    if (!isHoveringRef.current && typeof lastRsi === "number") {
+      try {
+        const y = (rsiSeriesRef.current as any)?.priceToCoordinate?.(lastRsi);
+        if (typeof y === "number" && Number.isFinite(y)) {
+          setRsiOverlay({ y, text: lastRsi.toFixed(2) });
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     // Enforce Model 1 window pinning
     if (!syncChart) {
         applyVisibleWindow(chart, rsiData.length, visibleCount ?? null);
     }
-  }, [rsiData, guide30, guide70, visibleCount]);
+  }, [anchorLine, rsiData, guide30, guide70, visibleCount, lastRsi]);
 
   return (
     <div className="flex h-full w-full flex-col">
@@ -261,14 +407,24 @@ export default function RsiPane({
         </div>
       </div>
       <div
-        ref={containerRef}
         className={
           height
-            ? "w-full rounded-md border border-neutral-900 bg-neutral-950"
-            : "min-h-0 flex-1 w-full rounded-md border border-neutral-900 bg-neutral-950"
+            ? "relative w-full rounded-md border border-neutral-900 bg-neutral-950"
+            : "relative min-h-0 flex-1 w-full rounded-md border border-neutral-900 bg-neutral-950"
         }
         style={height ? { height } : undefined}
-      />
+      >
+        <div ref={containerRef} className="absolute inset-0" />
+
+        {rsiOverlay ? (
+          <div
+            className="pointer-events-none absolute right-1 z-50 rounded bg-neutral-900/90 px-1.5 py-0.5 text-[11px] tabular-nums text-neutral-100"
+            style={{ top: rsiOverlay.y, transform: "translateY(-50%)" }}
+          >
+            RSI {rsiOverlay.text}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

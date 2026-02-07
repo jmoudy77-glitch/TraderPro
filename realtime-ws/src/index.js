@@ -19,6 +19,7 @@ const MARKET_TZ = process.env.MARKET_TZ ?? "America/New_York";
 const RES_MINUTES = {
   "1m": 1,
   "5m": 5,
+  "15m": 15,
   "30m": 30,
 };
 
@@ -134,21 +135,22 @@ function computeMarketSessionKey(ms) {
   return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
 }
 
-function marketMidnightUtcMs(year, month, day) {
-  // Find the UTC instant that corresponds to 00:00:00 in MARKET_TZ for the given Y-M-D.
+function marketLocalTimeUtcMs(year, month, day, targetHour, targetMinute) {
+  // Find the UTC instant that corresponds to targetHour:targetMinute:00 in MARKET_TZ for the given Y-M-D.
   // Uses a small fixed-point iteration to converge.
-  let guess = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+  let guess = Date.UTC(year, month - 1, day, targetHour, targetMinute, 0, 0);
+
+  const desiredMinuteOfDay = targetHour * 60 + targetMinute;
 
   for (let i = 0; i < 4; i++) {
     const p = getMarketParts(guess);
 
-    // Compute how far (in minutes) the current market-local time is from desired local midnight.
+    // Compute current market-local minute-of-day.
     let minuteOfDay = p.hour * 60 + p.minute;
 
     // If the market-local date is not the target day, adjust minuteOfDay by whole-day offsets.
     // (This can happen because `guess` is in UTC and the market TZ may be behind/ahead.)
     if (p.year !== year || p.month !== month || p.day !== day) {
-      // Compare dates by constructing a simple ordinal-like value.
       const ord = (yy, mm, dd) => yy * 10000 + mm * 100 + dd;
       const targetOrd = ord(year, month, day);
       const gotOrd = ord(p.year, p.month, p.day);
@@ -157,8 +159,9 @@ function marketMidnightUtcMs(year, month, day) {
       if (gotOrd > targetOrd) minuteOfDay += 24 * 60;
     }
 
-    // Move the guess backward by the observed local minutes-from-midnight.
-    guess -= minuteOfDay * 60_000;
+    // Move the guess backward by the observed local minutes-from-desired.
+    const diffMin = minuteOfDay - desiredMinuteOfDay;
+    guess -= diffMin * 60_000;
   }
 
   return guess;
@@ -168,7 +171,8 @@ function resetIntradaySession(nowMs, newKey) {
   intradaySession.sessionKey = newKey;
 
   const p = getMarketParts(nowMs);
-  intradaySession.sessionStartTsMs = marketMidnightUtcMs(p.year, p.month, p.day);
+  // Set session start to premarket open 04:00 in MARKET_TZ.
+  intradaySession.sessionStartTsMs = marketLocalTimeUtcMs(p.year, p.month, p.day, 4, 0);
 
   // Clear all intraday candle stores (Phase 5-5).
   for (const bySymbol of candlesByResThenSymbol.values()) {
@@ -191,6 +195,7 @@ function ensureIntradaySession(nowMs) {
 const candlesByResThenSymbol = new Map([
   ["1m", new Map()],
   ["5m", new Map()],
+  ["15m", new Map()],
   ["30m", new Map()],
 ]);
 
@@ -208,6 +213,238 @@ function getOrInitCandleStore(res, symbol) {
   }
 
   return store;
+}
+
+// --- Intraday bars backfill (REST) ---
+// Purpose: make realtime-ws a durable intraday candle provider on cold cache.
+// This does NOT create any additional Alpaca WS connections.
+
+const BARS_TIMEFRAME_BY_RES = {
+  "1m": "1Min",
+  "5m": "5Min",
+  "15m": "15Min",
+  "30m": "30Min",
+};
+
+/** @type {Map<string, Promise<{ ok: boolean, filled: boolean, error: string|null }>>} */
+const inFlightBarsFill = new Map();
+
+function clampInt(n, lo, hi, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(lo, Math.min(hi, Math.floor(v)));
+}
+
+function toBarTsMs(t) {
+  // Alpaca bars timestamps are typically RFC3339 strings.
+  if (t == null) return null;
+  if (typeof t === "string") {
+    const ms = Date.parse(t);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof t === "number") {
+    if (!Number.isFinite(t)) return null;
+    if (t >= 1e15) return Math.floor(t / 1e6); // ns -> ms
+    if (t >= 1e12) return Math.floor(t); // ms
+    if (t >= 1e9) return Math.floor(t * 1000); // s -> ms
+  }
+  return null;
+}
+
+async function fetchAlpacaBars(symbol, res, startMs, endMs, limit) {
+  const sym = String(symbol ?? "").trim().toUpperCase();
+  const tf = BARS_TIMEFRAME_BY_RES[String(res)] ?? null;
+  if (!sym) return { bars: [], error: "bad_symbol" };
+  if (!tf) return { bars: [], error: "bad_res" };
+
+  if (!ALPACA_REST_BASE_URL || !ALPACA_KEY || !ALPACA_SECRET) {
+    return { bars: [], error: "missing_rest_env" };
+  }
+
+  const startIso = isoFromMs(startMs);
+  const endIso = isoFromMs(endMs);
+
+  const collected = [];
+  const target = clampInt(limit, 1, 5000, 500);
+
+  // Alpaca bars endpoint paginates via next_page_token.
+  // We page until we reach `target` or no next_page_token remains.
+  let pageToken = null;
+  let safetyPages = 0;
+
+  while (collected.length < target) {
+    safetyPages += 1;
+    if (safetyPages > 20) break; // hard safety to avoid loops
+
+    const remaining = target - collected.length;
+
+    const url = new URL(`${ALPACA_REST_BASE_URL}/v2/stocks/${encodeURIComponent(sym)}/bars`);
+    url.searchParams.set("timeframe", tf);
+    url.searchParams.set("start", startIso);
+    url.searchParams.set("end", endIso);
+    url.searchParams.set("limit", String(Math.max(1, Math.min(10000, remaining))));
+    url.searchParams.set("sort", "asc");
+
+    if (providerStatus.feed) url.searchParams.set("feed", String(providerStatus.feed));
+    if (pageToken) url.searchParams.set("page_token", pageToken);
+
+    try {
+      const resp = await fetch(url.toString(), {
+        method: "GET",
+        headers: {
+          "APCA-API-KEY-ID": ALPACA_KEY,
+          "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        },
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        return { bars: [], error: `http_${resp.status}${text ? ":" + text.slice(0, 160) : ""}` };
+      }
+
+      const data = await resp.json();
+      const bars = Array.isArray(data?.bars) ? data.bars : [];
+      for (const b of bars) {
+        collected.push(b);
+        if (collected.length >= target) break;
+      }
+
+      const next = typeof data?.next_page_token === "string" ? data.next_page_token : null;
+      pageToken = next && next.length > 0 ? next : null;
+
+      // No more pages, stop.
+      if (!pageToken) break;
+
+      // If the API returned no bars, stop to avoid spinning.
+      if (bars.length === 0) break;
+    } catch (e) {
+      return { bars: [], error: String(e?.message ?? e ?? "fetch_error") };
+    }
+  }
+
+  return { bars: collected, error: null };
+}
+
+function mapAlpacaBarToCandle(b) {
+  const ts = toBarTsMs(b?.t);
+  if (typeof ts !== "number") return null;
+  const o = Number(b?.o);
+  const h = Number(b?.h);
+  const l = Number(b?.l);
+  const c = Number(b?.c);
+  const v = Number(b?.v ?? 0);
+  if (!Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) return null;
+  return { ts, o, h, l, c, v: Number.isFinite(v) ? v : 0 };
+}
+
+function alignToBucketStart(ms, res) {
+  try {
+    return bucketStartTsMs(ms, res);
+  } catch {
+    return ms;
+  }
+}
+
+function computeExpectedBarsForWindow({ windowStartMs, nowMs, res }) {
+  const stepMin = RES_MINUTES[String(res)] ?? null;
+  if (!stepMin) return null;
+
+  const stepMs = stepMin * 60_000;
+
+  const startAligned = alignToBucketStart(windowStartMs, res);
+  const endAligned = alignToBucketStart(nowMs, res);
+
+  const span = endAligned - startAligned;
+  if (!Number.isFinite(span) || span < 0) return null;
+
+  // Inclusive endpoints: start bucket .. end bucket
+  return Math.max(0, Math.floor(span / stepMs) + 1);
+}
+
+function mergeCandlesPreferWsLatest({ existing, rest, nowMs, res }) {
+  // Merge by ts; for CLOSED buckets prefer REST (more complete),
+  // for the CURRENT forming bucket prefer existing WS candle.
+  const formingBucketTs = alignToBucketStart(nowMs, res);
+
+  /** @type {Map<number, { ts:number, o:number, h:number, l:number, c:number, v:number }>} */
+  const byTs = new Map();
+
+  for (const c of Array.isArray(existing) ? existing : []) {
+    if (c && typeof c.ts === "number") byTs.set(c.ts, c);
+  }
+
+  for (const c of Array.isArray(rest) ? rest : []) {
+    if (!c || typeof c.ts !== "number") continue;
+
+    // If this bucket is the currently forming bucket, keep WS.
+    if (c.ts === formingBucketTs && byTs.has(c.ts)) continue;
+
+    // Otherwise prefer REST (fills gaps / normalizes closed candles).
+    byTs.set(c.ts, c);
+  }
+
+  const merged = Array.from(byTs.values()).sort((a, b) => a.ts - b.ts);
+  return merged;
+}
+
+/**
+ * Ensures intraday bars exist for the current session window.
+ * - On cold cache: fills.
+ * - On undersupply (partial cache): backfills and merges.
+ * This is REST-only and does not create additional Alpaca WS connections.
+ */
+async function ensureIntradayBarsFilled({ symbol, res, windowStartMs, nowMs, limit }) {
+  const key = `${intradaySession.sessionKey ?? ""}:${String(res)}:${String(symbol).trim().toUpperCase()}`;
+
+  if (inFlightBarsFill.has(key)) return inFlightBarsFill.get(key);
+
+  const p = (async () => {
+    try {
+      const store = getOrInitCandleStore(res, symbol);
+
+      const hardLimitRequested = clampInt(limit, 1, 5000, 500);
+      const startMs = typeof windowStartMs === "number" ? windowStartMs : nowMs - 24 * 60 * 60 * 1000;
+      const endMs = typeof nowMs === "number" ? nowMs : Date.now();
+
+      const expected =
+        typeof windowStartMs === "number" ? computeExpectedBarsForWindow({ windowStartMs, nowMs: endMs, res }) : null;
+
+      const have = store.candles.length;
+      const undersupplied = typeof expected === "number" && expected > 0 ? have < expected * 0.9 : false;
+
+      // If we already have enough, do nothing.
+      if (have > 0 && !undersupplied) return { ok: true, filled: false, error: null };
+
+      // Fetch enough bars to cover the expected window (bounded).
+      const hardLimit =
+        typeof expected === "number" && expected > 0 ? clampInt(Math.max(hardLimitRequested, expected), 1, 5000, 500) : hardLimitRequested;
+
+      const { bars, error } = await fetchAlpacaBars(symbol, res, startMs, endMs, hardLimit);
+      if (error) return { ok: false, filled: false, error };
+
+      const restCandles = [];
+      for (const b of bars) {
+        const c = mapAlpacaBarToCandle(b);
+        if (!c) continue;
+        if (typeof windowStartMs === "number" && c.ts < windowStartMs) continue;
+        restCandles.push(c);
+      }
+
+      // Merge with existing WS candles to preserve the forming candle built from ticks.
+      const merged = mergeCandlesPreferWsLatest({ existing: store.candles, rest: restCandles, nowMs: endMs, res });
+
+      // Replace cache view for the session window.
+      store.candles = merged;
+      store.lastUpdateTsMs = Date.now();
+
+      return { ok: true, filled: merged.length > 0, error: null };
+    } finally {
+      inFlightBarsFill.delete(key);
+    }
+  })();
+
+  inFlightBarsFill.set(key, p);
+  return p;
 }
 
 /** @type {Set<string>} */
@@ -336,7 +573,7 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
   if (url.pathname === "/health") {
@@ -375,7 +612,7 @@ const server = http.createServer((req, res) => {
     const resRaw = (url.searchParams.get("res") ?? "").toLowerCase();
 
     const symbol = symbolRaw.trim().toUpperCase();
-    const allowedRes = new Set(["1m", "5m", "30m"]);
+    const allowedRes = new Set(["1m", "5m", "15m", "30m"]);
 
     if (!symbol) {
       return json(res, 400, { ok: false, error: "BAD_REQUEST", detail: "missing_symbol" });
@@ -400,6 +637,22 @@ const server = http.createServer((req, res) => {
     // --- Phase 5-3: wire endpoint to the store; still safe on empty ---
     const store = getOrInitCandleStore(resRaw, symbol);
 
+    // Backfill-on-miss: if cache is cold/empty, fetch bars from Alpaca REST and seed the in-memory store.
+    // This preserves the single intraday truth surface while allowing WS to be the primary candle provider.
+    // NOTE: This is a REST call only; it does not create any additional WS connections.
+    const windowStartForRead = intradaySession.sessionStartTsMs;
+
+    // Backfill-on-miss OR backfill-on-undersupply: if cache is cold/partial, fetch bars from Alpaca REST
+    // and merge into the in-memory store to cover the session window.
+    // NOTE: REST-only; does not create any additional WS connections.
+    await ensureIntradayBarsFilled({
+      symbol,
+      res: resRaw,
+      windowStartMs: windowStartForRead,
+      nowMs,
+      limit,
+    }).catch(() => null);
+
     let cacheStatus = "MISS";
     if (store.lastUpdateTsMs != null) {
       cacheStatus = store.candles.length > 0 ? "HIT" : "EMPTY";
@@ -409,8 +662,8 @@ const server = http.createServer((req, res) => {
       symbol,
       resolution: resRaw,
       window: {
-        // v1 session boundary is defined later (Phase 5-5). Keep explicit fields now.
         session_key: intradaySession.sessionKey,
+        // Intraday window starts at premarket open (04:00 MARKET_TZ).
         session_start_ts: intradaySession.sessionStartTsMs != null ? new Date(intradaySession.sessionStartTsMs).toISOString() : null,
       },
       last_update_ts: store.lastUpdateTsMs != null ? new Date(store.lastUpdateTsMs).toISOString() : null,

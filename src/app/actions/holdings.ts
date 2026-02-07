@@ -12,28 +12,37 @@ function getAdmin() {
 
 function normalizeWatchlistKey(raw: string): string {
   const input = (raw ?? "").trim();
-  const upper = input.toUpperCase();
-  if (!upper) return "";
+  if (!input) return "";
 
-  // Allow canonical reserved keys exactly.
-  if (
-    upper === "SENTINEL" ||
-    upper === "LAUNCH_LEADERS" ||
-    upper === "HIGH_VELOCITY_MULTIPLIERS" ||
-    upper === "SLOW_BURNERS"
-  ) {
-    return upper;
-  }
+  // Start from a normalized uppercase slug so UI labels like "Safe Havens" or "High-Velocity Multipliers"
+  // reliably map to their canonical DB keys.
+  const upper = input.toUpperCase();
+  const slugBase = upper
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!slugBase) return "";
+
+  // Allow canonical reserved keys and common aliases.
+  const RESERVED_ALIASES: Record<string, string> = {
+    SENTINEL: "SENTINEL",
+    SENTINELS: "SENTINEL",
+    SAFE_HAVENS: "SAFE_HAVENS",
+    SAFE_HAVEN: "SAFE_HAVENS",
+    LAUNCH_LEADERS: "LAUNCH_LEADERS",
+    HIGH_VELOCITY_MULTIPLIERS: "HIGH_VELOCITY_MULTIPLIERS",
+    SLOW_BURNERS: "SLOW_BURNERS",
+  };
+
+  const canonicalReserved = RESERVED_ALIASES[slugBase];
+  if (canonicalReserved) return canonicalReserved;
 
   // If it's already a canonical custom key, keep it (idempotent).
-  if (/^CUSTOM_[A-Z0-9_]{1,44}$/.test(upper)) {
-    return upper;
+  if (/^CUSTOM_[A-Z0-9_]{1,44}$/.test(slugBase)) {
+    return slugBase;
   }
 
   // Custom keys must live under CUSTOM_ namespace to satisfy DB constraint.
-  const slugBase = upper.replace(/[^A-Z0-9]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
-  if (!slugBase) return "";
-
   const slug = slugBase.slice(0, 44); // DB: ^CUSTOM_[A-Z0-9_]{1,44}$
   return `CUSTOM_${slug}`;
 }
@@ -295,6 +304,7 @@ export async function createWatchlist(
 
 const RESERVED_WATCHLIST_KEYS = new Set([
   "SENTINEL",
+  "SAFE_HAVENS",
   "LAUNCH_LEADERS",
   "HIGH_VELOCITY_MULTIPLIERS",
   "SLOW_BURNERS",

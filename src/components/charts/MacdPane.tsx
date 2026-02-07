@@ -6,6 +6,7 @@ import {
   LineSeries,
   HistogramSeries,
   ColorType,
+  LineStyle,
   type IChartApi,
   type ISeriesApi,
   type LineData,
@@ -27,6 +28,7 @@ type Props = {
   timeScaleVisible?: boolean;
 };
 
+
 function applyVisibleWindow(
   chart: IChartApi,
   dataLength: number,
@@ -40,6 +42,13 @@ function applyVisibleWindow(
   const to = Math.max(0, dataLength - 1);
   const from = Math.max(0, to - (visibleCount - 1));
   chart.timeScale().setVisibleLogicalRange({ from, to });
+}
+
+function toUTCTimestamp(t: number): UTCTimestamp {
+  // If t looks like milliseconds since epoch, convert to seconds.
+  // Otherwise assume it's already seconds.
+  const seconds = t > 20_000_000_000 ? Math.floor(t / 1000) : Math.floor(t);
+  return seconds as UTCTimestamp;
 }
 
 export default function MacdPane({
@@ -58,6 +67,10 @@ export default function MacdPane({
   const macdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const signalSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const histSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const anchorSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+
+  const macdLabelRef = useRef<any>(null);
+  const signalLabelRef = useRef<any>(null);
 
   const syncChartRef = useRef<IChartApi | null>(null);
   const visibleCountRef = useRef<number | null>(null);
@@ -72,6 +85,14 @@ export default function MacdPane({
   }, [visibleCount]);
 
   const normalizedCandles = useMemo(() => normalizeCandles(candles), [candles]);
+  const anchorLine = useMemo(
+    () =>
+      normalizedCandles.map((c) => ({
+        time: toUTCTimestamp(Number(c.time)),
+        value: 0,
+      })) as LineData<UTCTimestamp>[],
+    [normalizedCandles]
+  );
   const macdPack = useMemo(
     () => computeMacd(normalizedCandles, 12, 26, 9),
     [normalizedCandles]
@@ -177,6 +198,7 @@ export default function MacdPane({
       layout: {
         background: { type: ColorType.Solid, color: "#0a0a0a" },
         textColor: "#a3a3a3",
+        attributionLogo: false,
       },
       rightPriceScale: {
         borderVisible: false,
@@ -192,11 +214,11 @@ export default function MacdPane({
       },
       grid: {
         vertLines: { visible: false },
-        horzLines: { visible: true },
+        horzLines: { visible: false },
       },
       crosshair: {
         vertLine: { visible: true },
-        horzLine: { visible: true },
+        horzLine: { visible: false},
       },
 
       // Disable independent interaction; this pane is slaved to the primary.
@@ -207,18 +229,69 @@ export default function MacdPane({
     chartRef.current = chart;
     onChartReady?.(chart);
 
+    const anchor = chart.addSeries(LineSeries, {
+      lineWidth: 1,
+      priceScaleId: "right",
+      color: "rgba(0,0,0,0)",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+
     const hist = chart.addSeries(HistogramSeries, { priceScaleId: "right", base: 0 });
     const macd = chart.addSeries(LineSeries, {
       lineWidth: 2,
       priceScaleId: "right",
       color: "rgba(147,197,253,0.95)",
+      priceLineVisible: false,
+      lastValueVisible: false,
     });
+    macd.createPriceLine({
+      price: 1,
+      color: "rgba(229,229,229,0.6)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dotted,
+      axisLabelVisible: false,
+    });
+
+    macd.createPriceLine({
+      price: -1,
+      color: "rgba(229,229,229,0.6)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dotted,
+      axisLabelVisible: false,
+    });
+
     const signal = chart.addSeries(LineSeries, {
       lineWidth: 2,
       priceScaleId: "right",
       color: "rgba(196,181,253,0.95)",
+      priceLineVisible: false,
+      lastValueVisible: false,
     });
 
+    // Label-only right-scale values (no horizontal lines). We'll update these on crosshair move.
+    macdLabelRef.current = (macd as any).createPriceLine?.({
+      price: 0,
+      color: "rgba(147,197,253,0.95)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+      lineVisible: false,
+      title: "MACD",
+    });
+
+    signalLabelRef.current = (signal as any).createPriceLine?.({
+      price: 0,
+      color: "rgba(196,181,253,0.95)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+      lineVisible: false,
+      title: "SIG",
+    });
+
+    anchorSeriesRef.current = anchor;
     histSeriesRef.current = hist;
     macdSeriesRef.current = macd;
     signalSeriesRef.current = signal;
@@ -236,7 +309,10 @@ export default function MacdPane({
       const srcChart = syncChartRef.current;
       if (srcChart) {
         const range = srcChart.timeScale().getVisibleLogicalRange();
-        if (range) ch.timeScale().setVisibleLogicalRange(range as any);
+        if (range) {
+          // Sync by logical range now that the anchor series makes timeScale points identical.
+          ch.timeScale().setVisibleLogicalRange(range as any);
+        }
       } else {
         applyVisibleWindow(ch, dataLenRef.current, visibleCountRef.current);
       }
@@ -248,6 +324,9 @@ export default function MacdPane({
       ro.disconnect();
       chart.remove();
       chartRef.current = null;
+      macdLabelRef.current = null;
+      signalLabelRef.current = null;
+      anchorSeriesRef.current = null;
       macdSeriesRef.current = null;
       signalSeriesRef.current = null;
       histSeriesRef.current = null;
@@ -276,13 +355,88 @@ export default function MacdPane({
     };
   }, [syncChart]);
 
+  // Crosshair sync (mirror primary chart hover)
+  useEffect(() => {
+    const destChart = chartRef.current;
+    const anchor = anchorSeriesRef.current;
+    if (!destChart || !syncChart || !anchor) return;
+
+    const handler = (param: any) => {
+      try {
+        const t = param?.time;
+        if (t != null) {
+          // Use the invisible anchor series so the timeScale mapping matches the primary.
+          (destChart as any).setCrosshairPosition?.(0, t, anchor as any);
+
+          const mv = macdByTime.get(t as any);
+          const sv = signalByTime.get(t as any);
+
+          if (typeof mv === "number") {
+            try {
+              macdLabelRef.current?.applyOptions?.({ price: mv });
+            } catch {
+              // ignore
+            }
+          }
+
+          if (typeof sv === "number") {
+            try {
+              signalLabelRef.current?.applyOptions?.({ price: sv });
+            } catch {
+              // ignore
+            }
+          }
+        } else {
+          (destChart as any).clearCrosshairPosition?.();
+
+          // Revert labels to last values when not hovering.
+          if (typeof lastMacd === "number") {
+            try {
+              macdLabelRef.current?.applyOptions?.({ price: lastMacd });
+            } catch {
+              // ignore
+            }
+          }
+          if (typeof lastSignal === "number") {
+            try {
+              signalLabelRef.current?.applyOptions?.({ price: lastSignal });
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    (syncChart as any).subscribeCrosshairMove?.(handler);
+
+    return () => {
+      try {
+        (syncChart as any).unsubscribeCrosshairMove?.(handler);
+      } catch {
+        // ignore
+      }
+      try {
+        (destChart as any).clearCrosshairPosition?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, [syncChart, macdByTime, signalByTime, lastMacd, lastSignal]);
+
   // Update data
   useEffect(() => {
     const chart = chartRef.current;
+    const anchor = anchorSeriesRef.current;
     const macd = macdSeriesRef.current;
     const signal = signalSeriesRef.current;
     const hist = histSeriesRef.current;
-    if (!chart || !macd || !signal || !hist) return;
+    if (!chart || !anchor || !macd || !signal || !hist) return;
+
+    // Ensure timeScale points match the candle chart (prevents pan-sync drift).
+    anchor.setData(anchorLine);
 
     hist.setData(histogram);
     macd.setData(macdLine);
@@ -291,7 +445,7 @@ export default function MacdPane({
     if (!syncChart) {
       applyVisibleWindow(chart, histogram.length, visibleCount ?? null);
     }
-  }, [histogram, macdLine, signalLine, visibleCount, syncChart]);
+  }, [anchorLine, histogram, macdLine, signalLine, visibleCount, syncChart]);
 
   return (
     <div className="flex h-full w-full flex-col">

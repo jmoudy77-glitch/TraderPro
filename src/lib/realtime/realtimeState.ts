@@ -1,28 +1,20 @@
 // src/lib/realtime/realtimeState.ts
 //
 // Phase 6-4: Centralized Realtime State (truth-preserving).
+// TICKS-ONLY CONTRACT (Single Endpoint Transition):
+// - This module must NEVER fetch or cache historical candle arrays.
+// - Historical hydration is exclusively served by `/api/market/candles/window` via useCandles.
+// - This store only reflects WS tick ingestion + provider/subscription state.
 // - No background polling.
 // - No inference/smoothing.
 // - Stores raw HTTP + WS payloads, renders verbatim in UI.
 
 import { realtimeWsAdapter } from "@/lib/realtime/wsClientAdapter";
 
-export type IntradayResolution = "1m" | "5m" | "30m";
-
 export type HealthPayload =
   | {
       ok: true;
       [k: string]: any; // truth-preserving: store verbatim
-    }
-  | {
-      ok: false;
-      error: { code: string; message: string; upstream: "fly"; status: number | null };
-    };
-
-export type CandlesPayload =
-  | {
-      candles: any[];
-      meta: Record<string, any>;
     }
   | {
       ok: false;
@@ -47,20 +39,8 @@ export type RealtimeState = {
   // WS ticks (verbatim md/latest payloads)
   lastTickBySymbol: Record<string, any>;
 
-  // HTTP snapshots (verbatim)
+  // HTTP snapshots (verbatim) — health only; no historical candle hydration
   lastHealth: HealthPayload | null;
-
-  // HTTP candles keyed by symbol|res
-  intradayByKey: Record<
-    string,
-    {
-      key: string; // `${SYMBOL}|${res}`
-      symbol: string;
-      res: IntradayResolution;
-      payload: CandlesPayload;
-      fetchedAt: number;
-    }
-  >;
 };
 
 type Listener = () => void;
@@ -69,10 +49,6 @@ function normalizeSymbols(symbols: string[]): string[] {
   return (symbols ?? [])
     .map((s) => String(s ?? "").trim().toUpperCase())
     .filter(Boolean);
-}
-
-function keyFor(symbol: string, res: IntradayResolution) {
-  return `${symbol}|${res}`;
 }
 
 const state: RealtimeState = {
@@ -91,8 +67,6 @@ const state: RealtimeState = {
   lastTickBySymbol: {},
 
   lastHealth: null,
-
-  intradayByKey: {},
 };
 
 
@@ -132,7 +106,6 @@ function buildSnapshot(): RealtimeState {
     },
     trackedSymbols: [...state.trackedSymbols],
     lastTickBySymbol: { ...state.lastTickBySymbol },
-    intradayByKey: { ...state.intradayByKey },
     lastHealth: state.lastHealth
       ? typeof state.lastHealth === "object"
         ? { ...(state.lastHealth as any) }
@@ -144,9 +117,17 @@ function buildSnapshot(): RealtimeState {
 // Cached snapshot that is stable between emits
 let snapshot: RealtimeState = buildSnapshot();
 
+let emitScheduled = false;
+
 function emit() {
-  snapshot = buildSnapshot();
-  for (const l of listeners) l();
+  if (emitScheduled) return;
+  emitScheduled = true;
+
+  queueMicrotask(() => {
+    emitScheduled = false;
+    snapshot = buildSnapshot();
+    for (const l of listeners) l();
+  });
 }
 
 export const realtimeState = {
@@ -249,49 +230,5 @@ export const realtimeState = {
     state.lastHealth = json as HealthPayload;
     emit();
     return state.lastHealth;
-  },
-
-  async fetchIntradayCandles(
-    symbol: string,
-    res: IntradayResolution,
-    limit?: number
-  ): Promise<CandlesPayload> {
-    const sym = String(symbol ?? "").trim().toUpperCase();
-
-    const params = new URLSearchParams();
-    params.set("symbol", sym);
-    params.set("res", res);
-    if (limit != null) params.set("limit", String(limit));
-
-    const url = `/api/realtime/candles/intraday?${params.toString()}`;
-    const httpRes = await fetch(url, { method: "GET", cache: "no-store" });
-    const text = await httpRes.text();
-
-    let json: any;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      json = {
-        ok: false,
-        error: {
-          code: "BAD_JSON",
-          message: "Non-JSON response",
-          upstream: "fly",
-          status: null,
-        },
-      };
-    }
-
-    const k = keyFor(sym, res);
-    state.intradayByKey[k] = {
-      key: k,
-      symbol: sym,
-      res,
-      payload: json as CandlesPayload,
-      fetchedAt: Date.now(),
-    };
-    emit();
-
-    return state.intradayByKey[k].payload;
   },
 };

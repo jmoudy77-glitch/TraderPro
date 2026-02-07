@@ -2,127 +2,240 @@
 import { NextResponse } from "next/server";
 import { LOCAL_WATCHLISTS } from "@/lib/watchlists/local-watchlists";
 import { createClient } from "@supabase/supabase-js";
-import { getProfile } from "@/lib/market-data/twelvedata";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-const DRY_RUN = process.env.SECTOR_HYDRATOR_DRY_RUN === "1";
-const MAX = Number(process.env.MAX_SECTOR_HYDRATES_PER_TICK ?? "5");
-
 function normalizeSymbol(s: string) {
   return s.trim().toUpperCase();
-}
-
-function deriveSectorCode(sector: string): string {
-  // Keep this deterministic + compatible with your sectors table
-  // (If you already have a mapping table, use it instead.)
-  return sector.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
-}
-
-function normalizeIndustry(raw: string): string {
-  return raw
-    .trim()
-    .replace(/[–—]/g, "-")
-    .replace(/&/g, "AND")
-    .replace(/\s+/g, " ")
-    .toUpperCase();
-}
-
-function deriveIndustryCode(industry: string): string {
-  return industry.replace(/[^A-Z0-9]+/g, "_");
-}
-
-const INDUSTRY_ABBREV_OVERRIDES: Record<string, string> = {
-  CAPITAL_MARKETS: "CAP-MKTS",
-  OIL_AND_GAS_MIDSTREAM: "OIL-GAS",
-  OTHER_INDUSTRIAL_METALS_AND_MINING: "MTL-MIN",
-  SEMICONDUCTORS: "SEMIS",
-  SOFTWARE_APPLICATION: "SW-APP",
-  SOFTWARE_INFRASTRUCTURE: "SW-INFRA",
-};
-
-function deriveIndustryAbbrev(industryCode: string): string {
-  const override = INDUSTRY_ABBREV_OVERRIDES[industryCode];
-  if (override) return override;
-
-  // Stopwords / low-signal tokens to drop from the abbreviation.
-  const STOP = new Set(["OTHER", "AND", "OF", "THE", "FOR", "IN", "ON", "TO", "WITH"]);
-
-  // Token-level abbreviations for common finance/industry words.
-  const TOK: Record<string, string> = {
-    APPLICATION: "APP",
-    BASIC: "BSC",
-    CAPITAL: "CAP",
-    COMMUNICATION: "COM",
-    CONSUMER: "CNS",
-    CYCLICAL: "CYC",
-    DEFENSIVE: "DEF",
-    ENERGY: "NRG",
-    EQUIPMENT: "EQP",
-    FINANCIAL: "FIN",
-    HEALTHCARE: "HLTH",
-    INDUSTRIAL: "IND",
-    INFRASTRUCTURE: "INF",
-    INFORMATION: "INFO",
-    INTERNET: "NET",
-    MATERIALS: "MAT",
-    METALS: "MTL",
-    MINING: "MIN",
-    OIL: "OIL",
-    GAS: "GAS",
-    REAL: "RE",
-    ESTATE: "EST",
-    RETAIL: "RTL",
-    SERVICES: "SVC",
-    SOFTWARE: "SW",
-    SEMICONDUCTORS: "SEMIS",
-    TECHNOLOGY: "TECH",
-    TRANSPORTATION: "TRNS",
-    UTILITIES: "UTIL",
-  };
-
-  const rawTokens = industryCode
-    .split("_")
-    .map((t) => t.trim())
-    .filter(Boolean)
-    .filter((t) => !STOP.has(t));
-
-  const mapToken = (t: string) => {
-    const m = TOK[t];
-    if (m) return m;
-    // Fallback: up to 4 chars for readability; prefer full token if already short.
-    return t.length <= 4 ? t : t.slice(0, 4);
-  };
-
-  // Prefer the most-specific tail tokens.
-  const tail = rawTokens.slice(-3).map(mapToken);
-
-  // Compose candidates from tail to head, trying to fit within 8 chars.
-  const candidates: string[] = [];
-  if (tail.length >= 2) candidates.push(`${tail[tail.length - 2]}-${tail[tail.length - 1]}`);
-  if (tail.length >= 3) candidates.push(`${tail[tail.length - 3]}-${tail[tail.length - 2]}`);
-  if (tail.length >= 1) candidates.push(`${tail[tail.length - 1]}`);
-
-  const MAX_LEN = 8;
-  for (const c of candidates) {
-    if (c.length <= MAX_LEN) return c;
-  }
-
-  // Last-resort: hard truncate to MAX_LEN.
-  return candidates[0].slice(0, MAX_LEN);
 }
 
 function isUuid(v: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
 
+type AlpacaBar = {
+  t: string; // RFC3339
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+  n?: number;
+  vw?: number;
+};
+
+function requireEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`MISSING_ENV:${name}`);
+  return v;
+}
+
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function fetchSymbolMetaNeedsHydrate(params: {
+  origin: string;
+  symbols: string[];
+}): Promise<{ needsHydrate: string[]; needsHydrateCount: number }> {
+  const all = Array.from(new Set((params.symbols ?? []).map(normalizeSymbol).filter(Boolean)));
+  if (all.length === 0) return { needsHydrate: [], needsHydrateCount: 0 };
+
+  const batches = chunk(all, 200);
+  const needs = new Set<string>();
+  let count = 0;
+
+  for (const b of batches) {
+    const u = new URL(`${params.origin}/api/market/symbol-meta`);
+    u.searchParams.set("symbols", b.join(","));
+    u.searchParams.set("debug", "1");
+
+    const res = await fetch(u.toString(), { cache: "no-store" });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`SYMBOL_META_HTTP_${res.status}:${text.slice(0, 200)}`);
+    }
+
+    const json: any = await res.json();
+    const list: string[] = (json?.debug?.needsHydrate ?? []) as any;
+    for (const s of list) needs.add(normalizeSymbol(s));
+    if (typeof json?.needsHydrateCount === "number") count += json.needsHydrateCount;
+    else count += list.length;
+  }
+
+  return { needsHydrate: Array.from(needs), needsHydrateCount: count };
+}
+
+function computeSectorCode(sector: string | null): string | null {
+  if (!sector) return null;
+  const s = sector.trim();
+  if (!s) return null;
+  return s.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim().split(/\s+/).join("").slice(0, 6) || null;
+}
+
+const ETF_INDEX_CLASSIFICATION: Record<string, { sector: string; industry: string; industry_code: string; industry_abbrev: string }> = {
+  QQQ: { sector: "ETF", industry: "Index ETF", industry_code: "INDEX_ETF", industry_abbrev: "IDX-ETF" },
+  ONEQ: { sector: "ETF", industry: "Index ETF", industry_code: "INDEX_ETF", industry_abbrev: "IDX-ETF" },
+  SPY: { sector: "ETF", industry: "Index ETF", industry_code: "INDEX_ETF", industry_abbrev: "IDX-ETF" },
+  DIA: { sector: "ETF", industry: "Index ETF", industry_code: "INDEX_ETF", industry_abbrev: "IDX-ETF" },
+  IWM: { sector: "ETF", industry: "Index ETF", industry_code: "INDEX_ETF", industry_abbrev: "IDX-ETF" },
+};
+
+async function hydrateSymbolClassificationEtfStubs(params: {
+  ownerUserId: string;
+  symbols: string[];
+}): Promise<{ hydrated: string[]; skipped: string[] }> {
+  const hydrated: string[] = [];
+  const skipped: string[] = [];
+
+  const now = new Date().toISOString();
+
+  const rows = (params.symbols ?? [])
+    .map(normalizeSymbol)
+    .filter(Boolean)
+    .map((symbol) => {
+      const c = ETF_INDEX_CLASSIFICATION[symbol];
+      if (!c) return null;
+      return {
+        symbol,
+        sector: c.sector,
+        sector_code: computeSectorCode(c.sector),
+        industry: c.industry,
+        industry_code: c.industry_code,
+        industry_abbrev: c.industry_abbrev,
+        updated_at: now,
+      };
+    })
+    .filter(Boolean) as any[];
+
+  const symbolsSet = new Set((params.symbols ?? []).map(normalizeSymbol).filter(Boolean));
+  for (const s of symbolsSet) {
+    if (ETF_INDEX_CLASSIFICATION[s]) hydrated.push(s);
+    else skipped.push(s);
+  }
+
+  if (rows.length === 0) return { hydrated: [], skipped };
+
+  const { error } = await supabase.from("symbol_classification").upsert(rows, { onConflict: "symbol" });
+  if (error) throw error;
+
+  return { hydrated, skipped };
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function isoMinusDays(days: number) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function nyTradeDateFromBarTs(ts: string): string {
+  // Returns YYYY-MM-DD in America/New_York
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(ts));
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value;
+  const y = get("year");
+  const m = get("month");
+  const d = get("day");
+  if (!y || !m || !d) return new Date(ts).toISOString().slice(0, 10);
+  return `${y}-${m}-${d}`;
+}
+
+async function upsertEodRows(rows: Array<{ symbol: string; trade_date: string; close: number }>) {
+  if (rows.length === 0) return 0;
+  const batches = chunk(rows, 1000);
+  let written = 0;
+  for (const batch of batches) {
+    const { error } = await supabase.from("symbol_eod").upsert(batch, { onConflict: "symbol,trade_date" });
+    if (error) throw error;
+    written += batch.length;
+  }
+  return written;
+}
+
+const TIMEFRAMES = [
+  { key: "1h" as const, alpaca: "1Hour", table: "candles_1h", recentDays: 3, bootstrapDays: 14 },
+  { key: "4h" as const, alpaca: "4Hour", table: "candles_4h", recentDays: 14, bootstrapDays: 60 },
+  { key: "1d" as const, alpaca: "1Day", table: "candles_daily", recentDays: 30, bootstrapDays: 400 },
+];
+
+async function fetchAlpacaBars(params: {
+  symbols: string[];
+  timeframe: string;
+  start: string;
+  end: string;
+  pageToken?: string | null;
+}) {
+  const ALPACA_KEY = requireEnv("ALPACA_KEY");
+  const ALPACA_SECRET = requireEnv("ALPACA_SECRET");
+
+  // Alpaca data v2 stocks bars endpoint.
+  // https://data.alpaca.markets/v2/stocks/bars?symbols=...&timeframe=...&start=...&end=...&feed=sip&adjustment=raw
+  const base = "https://data.alpaca.markets/v2/stocks/bars";
+  const url = new URL(base);
+  url.searchParams.set("symbols", params.symbols.join(","));
+  url.searchParams.set("timeframe", params.timeframe);
+  url.searchParams.set("start", params.start);
+  url.searchParams.set("end", params.end);
+  url.searchParams.set("feed", "sip");
+  url.searchParams.set("adjustment", "raw");
+  if (params.pageToken) url.searchParams.set("page_token", params.pageToken);
+
+  const res = await fetch(url.toString(), {
+    headers: {
+      "APCA-API-KEY-ID": ALPACA_KEY,
+      "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    },
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`ALPACA_BARS_HTTP_${res.status}:${text.slice(0, 200)}`);
+  }
+
+  const json: any = await res.json();
+
+  // Expected shape:
+  // { bars: { "AAPL": [{t,o,h,l,c,v,n,vw}, ...], ... }, next_page_token?: string }
+  const barsBySymbol: Record<string, AlpacaBar[]> = (json?.bars ?? {}) as any;
+  return { barsBySymbol, nextPageToken: json?.next_page_token ?? null };
+}
+
+async function upsertCandleRows(table: string, rows: any[]) {
+  if (rows.length === 0) return 0;
+
+  // Keep chunk size conservative for PostgREST payload limits.
+  const batches = chunk(rows, 1000);
+  let written = 0;
+
+  for (const batch of batches) {
+    const { error } = await supabase.from(table).upsert(batch, { onConflict: "symbol,ts" });
+    if (error) throw error;
+    written += batch.length;
+  }
+
+  return written;
+}
+
 export async function GET(req: Request) {
   const startedAt = new Date();
-
   const url = new URL(req.url);
+
+  const origin = url.origin;
+  const metaDebug = (url.searchParams.get("metaDebug") || "").toLowerCase() === "1";
+
   const ownerUserId =
     url.searchParams.get("ownerUserId") ||
     process.env.NEXT_PUBLIC_DEV_OWNER_USER_ID ||
@@ -136,14 +249,15 @@ export async function GET(req: Request) {
     );
   }
 
+  // mode=recent (default) keeps it light; mode=bootstrap does initial fill.
+  const mode = (url.searchParams.get("mode") || "recent").toLowerCase();
+  const isBootstrap = mode === "bootstrap";
+
   const watchlistKey = url.searchParams.get("watchlistKey")?.trim() || "";
-  const maxParam = url.searchParams.get("max")?.trim() || "";
-  const maxPerTick = Math.max(1, Math.min(50, Number(maxParam || MAX)));
 
-  // 2.1 Symbol collection
-  // - If watchlistKey is provided: ONLY that watchlist's symbols (scheduled warmer behavior)
-  // - Else: global set = all watchlists + held holdings + sentinel
-
+  // Symbol universe:
+  // - If watchlistKey provided: ONLY that watchlist’s symbols.
+  // - Else: all watchlists + held holdings + sentinel.
   let watchlistsQuery = supabase
     .from("watchlists")
     .select("id")
@@ -154,12 +268,8 @@ export async function GET(req: Request) {
   }
 
   const { data: watchlists, error: watchlistsErr } = await watchlistsQuery;
-
   if (watchlistsErr) {
-    return NextResponse.json(
-      { ok: false, error: watchlistsErr.message },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: watchlistsErr.message }, { status: 500 });
   }
 
   const watchlistIds = (watchlists ?? []).map((w: any) => w.id).filter(Boolean);
@@ -172,18 +282,12 @@ export async function GET(req: Request) {
       .in("watchlist_id", watchlistIds);
 
     if (watchlistSymbolsErr) {
-      return NextResponse.json(
-        { ok: false, error: watchlistSymbolsErr.message },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: watchlistSymbolsErr.message }, { status: 500 });
     }
 
-    symbolsFromWatchlists = (watchlistSymbols ?? [])
-      .map((r: any) => r.symbol)
-      .filter(Boolean);
+    symbolsFromWatchlists = (watchlistSymbols ?? []).map((r: any) => r.symbol).filter(Boolean);
   }
 
-  // Holdings (only in global mode)
   let symbolsFromHoldings: string[] = [];
   if (!watchlistKey) {
     const { data: holdings, error: holdingsErr } = await supabase
@@ -193,16 +297,11 @@ export async function GET(req: Request) {
       .eq("is_held", true);
 
     if (holdingsErr) {
-      return NextResponse.json(
-        { ok: false, error: holdingsErr.message },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: holdingsErr.message }, { status: 500 });
     }
-
     symbolsFromHoldings = (holdings ?? []).map((r: any) => r.symbol).filter(Boolean);
   }
 
-  // Sentinel (local) (only in global mode)
   let symbolsFromSentinel: string[] = [];
   if (!watchlistKey) {
     const sentinelRaw: any = (LOCAL_WATCHLISTS as any)?.SENTINEL;
@@ -214,141 +313,176 @@ export async function GET(req: Request) {
   }
 
   const set = new Set<string>();
-  for (const s of [
-    ...symbolsFromWatchlists,
-    ...symbolsFromHoldings,
-    ...symbolsFromSentinel,
-  ]) {
+  for (const s of [...symbolsFromWatchlists, ...symbolsFromHoldings, ...symbolsFromSentinel]) {
     const n = normalizeSymbol(s);
     if (n) set.add(n);
   }
+
+  // Index anchor for DB-owned daily analytics (e.g., industry-posture relToIndex).
+  // Only include in global mode (no watchlistKey) so watchlist-scoped ticks remain strict.
+  if (!watchlistKey) set.add("QQQ");
+
   const allSymbols = Array.from(set);
+
+  let metaNeedsHydrate: string[] = [];
+  let metaNeedsHydrateCount = 0;
+  let metaError: string | null = null;
+
+  try {
+    const r = await fetchSymbolMetaNeedsHydrate({ origin, symbols: allSymbols });
+    metaNeedsHydrate = r.needsHydrate;
+    metaNeedsHydrateCount = r.needsHydrateCount;
+  } catch (e: any) {
+    metaError = e?.message ?? String(e);
+  }
+
+  let symbolMetaHydratedEtf: string[] = [];
+  let symbolMetaSkippedEtf: string[] = [];
+
+  // If we have missing/expired symbol meta, opportunistically hydrate known ETF/index stubs.
+  // Alpaca does not provide sector/industry classification; this keeps ETF/index proxies from staying perpetually "missing".
+  if (metaNeedsHydrate.length > 0) {
+    try {
+      const r = await hydrateSymbolClassificationEtfStubs({ ownerUserId, symbols: metaNeedsHydrate });
+      symbolMetaHydratedEtf = r.hydrated;
+      symbolMetaSkippedEtf = r.skipped;
+
+      // Re-check after hydration to reflect updated truth.
+      const rr = await fetchSymbolMetaNeedsHydrate({ origin, symbols: allSymbols });
+      metaNeedsHydrate = rr.needsHydrate;
+      metaNeedsHydrateCount = rr.needsHydrateCount;
+    } catch (e: any) {
+      // Preserve original metaError if present; otherwise set it.
+      if (!metaError) metaError = e?.message ?? String(e);
+    }
+  }
 
   if (allSymbols.length === 0) {
     return NextResponse.json({
       ok: true,
-      dryRun: DRY_RUN,
+      mode,
       ownerUserId,
       watchlistKey: watchlistKey || null,
-      maxPerTick,
       sources: {
         watchlists: symbolsFromWatchlists.length,
         holdings: symbolsFromHoldings.length,
         sentinel: symbolsFromSentinel.length,
       },
       symbolsTotal: 0,
-      missCount: 0,
-      selectedCount: 0,
-      hydratedCount: 0,
-      errorCount: 0,
-      startedAt,
-      finishedAt: new Date(),
-    });
-  }
-
-  // Query existing classification rows
-  const { data: rows, error: readErr } = await supabase
-    .from("symbol_classification")
-    .select("symbol, sector, industry, updated_at")
-    .in("symbol", allSymbols);
-
-  if (readErr) {
-    return NextResponse.json({ ok: false, error: readErr.message }, { status: 500 });
-  }
-
-  const rowBySymbol = new Map<string, any>();
-  for (const r of rows ?? []) {
-    rowBySymbol.set(normalizeSymbol(r.symbol), r);
-  }
-
-  // Phase 2 miss semantics:
-  // - no row exists, OR
-  // - sector is null/empty
-  const misses: string[] = [];
-  for (const s of allSymbols) {
-    const r = rowBySymbol.get(s);
-    if (!r) {
-      misses.push(s);
-      continue;
-    }
-
-    const sector = (r.sector ?? "").toString().trim();
-    if (!sector) misses.push(s);
-  }
-
-  const selected = misses.slice(0, maxPerTick);
-
-  // Dry run (Rollout step 4)
-  if (DRY_RUN) {
-    return NextResponse.json({
-      ok: true,
-      dryRun: true,
-      ownerUserId,
-      watchlistKey: watchlistKey || null,
-      maxPerTick,
-      sources: {
-        watchlists: symbolsFromWatchlists.length,
-        holdings: symbolsFromHoldings.length,
-        sentinel: symbolsFromSentinel.length,
+      symbolMeta: {
+        needsHydrateCount: 0,
+        needsHydrate: metaDebug ? [] : null,
+        error: null,
+        hydratedEtf: metaDebug ? symbolMetaHydratedEtf : null,
+        skippedEtf: metaDebug ? symbolMetaSkippedEtf : null,
       },
-      symbolsTotal: allSymbols.length,
-      missCount: misses.length,
-      selectedCount: selected.length,
-      wouldHydrate: selected,
+      hydrated: { "1h": 0, "4h": 0, "1d": 0 },
       startedAt,
       finishedAt: new Date(),
     });
   }
 
-  // Writes enabled (Rollout step 5)
-  let hydratedCount = 0;
-  let errorCount = 0;
+  const end = nowIso();
 
-  for (const symbol of selected) {
+  // NOTE: We rely on Alpaca to return finalized bars for 1Hour/4Hour/1Day.
+  // We upsert idempotently; your retention policy trims the tables later.
+  const hydrated: Record<string, number> = { "1h": 0, "4h": 0, "1d": 0 };
+  let eodWritten = 0;
+  const errors: Array<{ timeframe: string; error: string }> = [];
+
+  for (const tf of TIMEFRAMES) {
+    const days = isBootstrap ? tf.bootstrapDays : tf.recentDays;
+    const start = isoMinusDays(days);
+
     try {
-      const profile = await getProfile(symbol); // Twelve Data /profile (1 credit)
-      const sector = (profile?.sector ?? "").trim();
-      const industryRaw = (profile?.industry ?? "").trim();
+      // Alpaca supports multi-symbol requests; keep batch size safe.
+      // 200 is conservative; you’re currently ~50 symbols anyway.
+      const symbolBatches = chunk(allSymbols, 200);
 
-      // If sector missing, do NOT write partials (schema invariants)
-      if (!sector) continue;
+      let totalRows = 0;
 
-      const { error: upsertErr } = await supabase
-        .from("symbol_classification")
-        .upsert(
-          {
-            symbol: normalizeSymbol(symbol),
-            sector,
-            industry: industryRaw || null,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "symbol" }
-        );
+      for (const symbols of symbolBatches) {
+        let pageToken: string | null = null;
+        let pageCount = 0;
 
-      if (upsertErr) throw upsertErr;
-      hydratedCount++;
-    } catch {
-      errorCount++;
-      // silent failure per Note; retry on later ticks
+        while (true) {
+          // Guard against infinite pagination loops.
+          if (pageCount++ > 200) throw new Error("ALPACA_BARS_PAGINATION_GUARD");
+
+          const { barsBySymbol, nextPageToken } = await fetchAlpacaBars({
+            symbols,
+            timeframe: tf.alpaca,
+            start,
+            end,
+            pageToken,
+          });
+
+          const rows: any[] = [];
+          const eodRows: Array<{ symbol: string; trade_date: string; close: number }> = [];
+
+          for (const [sym, bars] of Object.entries(barsBySymbol)) {
+            const symbol = normalizeSymbol(sym);
+            for (const b of bars ?? []) {
+              rows.push({
+                symbol,
+                ts: b.t,
+                o: b.o,
+                h: b.h,
+                l: b.l,
+                c: b.c,
+                v: b.v,
+              });
+
+              // `symbol_eod` is the durable session-based EOD tape.
+              // Populate ONLY from Alpaca 1Day bars.
+              if (tf.key === "1d") {
+                const trade_date = nyTradeDateFromBarTs(b.t);
+                if (trade_date && Number.isFinite(b.c)) {
+                  eodRows.push({ symbol, trade_date, close: b.c });
+                }
+              }
+            }
+          }
+
+          // Write this page immediately to keep memory bounded.
+          totalRows += await upsertCandleRows(tf.table, rows);
+          if (tf.key === "1d") {
+            eodWritten += await upsertEodRows(eodRows);
+          }
+
+          if (!nextPageToken) break;
+          pageToken = nextPageToken;
+        }
+      }
+
+      hydrated[tf.key] = totalRows;
+    } catch (e: any) {
+      errors.push({ timeframe: tf.key, error: e?.message ?? String(e) });
     }
   }
 
   return NextResponse.json({
     ok: true,
-    dryRun: false,
+    mode,
     ownerUserId,
     watchlistKey: watchlistKey || null,
-    maxPerTick,
     sources: {
       watchlists: symbolsFromWatchlists.length,
       holdings: symbolsFromHoldings.length,
       sentinel: symbolsFromSentinel.length,
     },
     symbolsTotal: allSymbols.length,
-    missCount: misses.length,
-    selectedCount: selected.length,
-    hydratedCount,
-    errorCount,
+    symbolMeta: {
+      needsHydrateCount: metaNeedsHydrateCount,
+      needsHydrate: metaDebug ? metaNeedsHydrate : null,
+      error: metaError,
+      hydratedEtf: metaDebug ? symbolMetaHydratedEtf : null,
+      skippedEtf: metaDebug ? symbolMetaSkippedEtf : null,
+    },
+    hydrated,
+    symbolEodWritten: eodWritten,
+    errorCount: errors.length,
+    errors: errors.length ? errors : null,
     startedAt,
     finishedAt: new Date(),
   });

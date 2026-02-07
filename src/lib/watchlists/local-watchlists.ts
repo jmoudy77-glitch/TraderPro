@@ -1,5 +1,6 @@
 export type WatchlistKey =
   | "SENTINEL"
+  | "SAFE_HAVENS"
   | "LAUNCH_LEADERS"
   | "HIGH_VELOCITY_MULTIPLIERS"
   | "SLOW_BURNERS";
@@ -21,6 +22,15 @@ export const LOCAL_WATCHLISTS: Record<WatchlistKey, string[]> = {
     "JPM",
     "XOM",
     "AMZN",
+  ],
+
+  SAFE_HAVENS: [
+    // Defensive / capital preservation
+    "TLT",
+    "IEF",
+    "GLD",
+    "XLU",
+    "XLP",
   ],
   
   LAUNCH_LEADERS: ["SOUN", "PLTR", "NVDA"],
