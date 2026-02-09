@@ -1,6 +1,10 @@
 // src/app/api/market/industry-posture/route.ts
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import {
+  createSupabaseServerAnon,
+  createSupabaseServerWithJwt,
+  createSupabaseServiceRole,
+} from "@/lib/supabase/server";
 import { LOCAL_WATCHLISTS } from "@/lib/watchlists/local-watchlists";
 
 type RelToIndex = "OUTPERFORM" | "INLINE" | "UNDERPERFORM";
@@ -55,16 +59,48 @@ function qpBool(v: string | null): boolean {
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
 
+function getBearerToken(req: Request): string | null {
+  const h = req.headers.get("authorization") ?? req.headers.get("Authorization");
+  if (!h) return null;
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m?.[1]?.trim() || null;
+}
 
+function getDevOwnerId() {
+  if (process.env.NODE_ENV !== "development") return null;
+  if (process.env.TRADERPRO_DEV_OWNER_FALLBACK !== "true") return null;
+  return process.env.TRADERPRO_DEV_OWNER_USER_ID || null;
+}
 
-function getAdmin() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+async function resolveActor(req: Request) {
+  const jwt = getBearerToken(req);
 
-  if (!url) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL");
-  if (!serviceKey) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
+  if (jwt) {
+    const supabase = createSupabaseServerAnon();
+    const { data: auth, error: authErr } = await supabase.auth.getUser(jwt);
+    if (authErr || !auth?.user) return { ok: false as const };
 
-  return createClient(url, serviceKey, { auth: { persistSession: false } });
+    const supabaseBound = createSupabaseServerWithJwt(jwt);
+    return {
+      ok: true as const,
+      uid: auth.user.id,
+      supabase: supabaseBound,
+      mode: "authed" as const,
+    };
+  }
+
+  const devOwnerId = getDevOwnerId();
+  if (devOwnerId) {
+    const supabase = createSupabaseServiceRole();
+    return {
+      ok: true as const,
+      uid: devOwnerId,
+      supabase,
+      mode: "dev" as const,
+    };
+  }
+
+  return { ok: false as const };
 }
 
 // Parse DB ts field to ms reliably, normalizing common Postgres output.
@@ -583,19 +619,16 @@ function relToIndexFromDelta(deltaPct: number): RelToIndex {
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-
-    const ownerUserId =
-      searchParams.get("ownerUserId") ||
-      process.env.TRADERPRO_DEV_OWNER_USER_ID ||
-      null;
     const watchlistKey = searchParams.get("watchlistKey"); // optional narrowing
     const scheduler = qpBool(searchParams.get("scheduler"));
     const cacheOnly = qpBool(searchParams.get("cacheOnly"));
     const debug = qpBool(searchParams.get("debug"));
 
-    if (!ownerUserId) {
-      return NextResponse.json({ ok: false, error: "MISSING_OWNER_USER_ID" }, { status: 400 });
+    const actor = await resolveActor(req);
+    if (!actor.ok) {
+      return NextResponse.json({ ok: false, error: "UNAUTHENTICATED" }, { status: 401 });
     }
+    const ownerUserId = actor.uid;
 
     const ttlMs = Number(process.env.INDUSTRY_POSTURE_TTL_MS ?? "60000");
     // NOTE: cache key must include request-affecting flags; otherwise cacheOnly/scheduler calls can replay non-stub results.
@@ -607,9 +640,8 @@ export async function GET(req: Request) {
     const inflight = INFLIGHT.get(cacheKey);
     if (inflight) return NextResponse.json(await inflight);
 
-
     const p = (async () => {
-      const supabase = getAdmin();
+      const supabase = actor.supabase;
 
       // -----------------------------
       // 1) Universe: DB watchlists + holdings, with LOCAL_WATCHLISTS fallback

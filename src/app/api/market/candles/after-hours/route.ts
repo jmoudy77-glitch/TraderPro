@@ -9,7 +9,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import { createSupabaseServiceRole } from "@/lib/supabase/server";
 
 // After-hours / extended-hours candles via Alpaca Data REST.
 // Defaults to the most relevant extended-hours window based on current ET.
@@ -27,12 +27,16 @@ import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
+function requireSchedulerAuth(req: Request): { ok: true } | { ok: false; error: string } {
+  const expected = process.env.TRADERPRO_SCHEDULER_SECRET || "";
+  if (!expected) return { ok: false, error: "SCHEDULER_SECRET_NOT_CONFIGURED" };
+  const got = req.headers.get("x-traderpro-scheduler-secret") ?? "";
+  if (!got || got !== expected) return { ok: false, error: "UNAUTHORIZED_SCHEDULER" };
+  return { ok: true };
+}
+
 function getAdmin() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL");
-  if (!key) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
-  return createSupabaseClient(url, key, { auth: { persistSession: false } });
+  return createSupabaseServiceRole();
 }
 
 function normalizeWatchlistKey(raw: string): string {
@@ -612,6 +616,10 @@ async function fetchAlpacaBars(args: {
 
 export async function GET(req: NextRequest) {
   try {
+    const authz = requireSchedulerAuth(req);
+    if (!authz.ok) {
+      return jsonError(401, authz.error);
+    }
     const url = new URL(req.url);
 
     const target = parseTarget(url.searchParams.get("target"));

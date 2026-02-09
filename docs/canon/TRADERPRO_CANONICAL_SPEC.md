@@ -82,10 +82,21 @@
     0.b **Edit tool target verification (oboe)**  
     When using `oboe.edit_file`, the assistant must adhere to the following:
 
-    - The assistant must not issue an edit unless the user has provided the **exact file-path header line** from the editor and explicitly confirmed it is the correct file.
+    - The assistant must not issue an edit unless the assitant has provided the **exact file-path header line** from the editor and user has explicitly confirmed it is the correct file.
     - After any `oboe.edit_file` operation, the assistant must treat the change as **unverified** until the user confirms that the intended file received the edit.
     - If there is any ambiguity in tool output (e.g., generic file handles such as `Update File: 0`), the assistant must stop and re-anchor on the file-path header before attempting further edits.
     - The assistant must not attempt corrective edits until the target file has been explicitly re-confirmed.
+
+    0.c **Edit confirmation scope**  
+    A confirmed file-path header applies only to the immediately following edit or to a tightly continuous sequence of edits within the same execution context.
+
+    If any of the following occur, the assistant must re-confirm the file-path header before further edits:
+    - a change in file target
+    - a change in dev plane
+    - a significant conversational break or topic shift
+    - a pause where the user re-evaluates or asks meta-questions about correctness
+
+    The assistant must not assume a prior confirmation remains valid across context shifts.
 
 1. **Stay in the current dev plane**  
    The assistant must stay within the scope of the current Dev Plane unless explicitly instructed otherwise.
@@ -125,7 +136,84 @@
     - the current Dev Plane Note, and  
     - this AOR section in Canon.
 
+11. **Dev Plane closure discipline**  
+    When a Dev Plane is closed, every item in its *State of Truth* must be explicitly resolved into exactly one of the following outcomes:
+
+- absorbed into **System Status** if it represents current operational reality,
+- absorbed into **Canon** if it establishes a rule, invariant, or ongoing constraint,
+- or allowed to **remain only in the closed Dev Plane Note** as historical execution context.
+
+State-of-Truth items must not persist implicitly across planes.
+
+12. **Checklist-first execution (no execution by implication)**  
+If a new fact or state discovery affects sequencing (e.g., “component does not exist,” “UI is not implemented,” “endpoint is deprecated,” “layout differs from assumption”), the assistant must:
+1) update the Dev Plane Execution Checklist to reflect the new reality, and only then
+2) propose or begin the next execution step.
+
+The assistant must not proceed based on implied next steps when the checklist has not been updated to reflect the discovered state.
+
 ---
+
+## 3.a Canonical Dev Plane Template
+
+All development work must be instantiated using the following Dev Plane structure.
+This template is mandatory and exists to prevent scope drift, implicit execution,
+and loss of procedural discipline.
+
+Deviation from this template requires explicit declaration in the Dev Plane Note.
+
+---
+
+# Dev Plane — <Name>
+
+Date:
+Primary focus:
+Related Canon: docs/canon/TRADERPRO_CANONICAL_SPEC.md  
+Related System Status: docs/ops/TRADERPRO_SYSTEM_STATUS_MASTER.md  
+
+---
+
+## Assistant Operating Rules (Active)
+
+<paste full AOR verbatim>
+
+---
+
+## Objective
+
+The objective of this dev plane is to:
+
+---
+
+## Scope
+
+### In Scope
+- 
+
+### Out of Scope
+- 
+
+---
+
+## Execution Checklist
+
+- [ ] 
+- [ ] 
+- [ ] 
+
+---
+
+## Forward-Compatibility Constraints
+
+- 
+- 
+
+---
+
+## State of Truth (As of <timestamp>)
+
+- 
+- 
 
 ## 4. Canonical System Planes (High Level)
 
@@ -153,12 +241,108 @@ TraderPro is composed of the following primary planes. Each plane is first-class
 
 ---
 
+## 4.a UI Shell — Right Rail Panel Wrapper Contract
+
+All right-rail panels must conform to a shared structural wrapper to ensure
+visual stability, consistent cognition surfaces, and predictable layout behavior.
+
+This contract exists to prevent partial-height panels, background bleed-through,
+and inconsistent interaction affordances across the cognition stack.
+
+### Canonical Wrapper Requirements
+
+Every right-rail panel MUST:
+
+- Fill its allocated rail slot completely
+- Paint an opaque, canonical surface (no transparency reliance)
+- Use a predictable header / body / footer flex structure
+- Never collapse to content height within a flex slot
+
+### Required DOM Structure
+
+Each panel must render the following structure at its root:
+
+```txt
+Rail Slot (provided by layout):  <div class="min-h-0 flex-1"> … </div>
+  Panel Root:                   <section class="h-full min-h-0 flex flex-col …">
+    Panel Header (optional):    <header class="shrink-0 …">
+    Panel Body:                 <div class="min-h-0 flex-1 overflow-auto …">
+    Panel Footer (optional):    <footer class="shrink-0 …">
+```
+
+Non-negotiables:
+- `h-full min-h-0 flex flex-col` on the panel root
+- `min-h-0 flex-1` on the panel body
+- Headers and footers must be `shrink-0`
+
+### Canonical Surface Tokens
+
+- Background: `bg-neutral-950` (or canonical rail surface token)
+- Border: `border border-neutral-800`
+- Radius: `rounded-lg`
+
+Panels must not rely on page or container backgrounds for visual continuity.
+
+### Canonical Implementation
+
+The canonical implementation of this contract is provided by:
+
+- `src/components/RailPanelFrame.tsx`
+
+All right-rail panels (Objective, Strategy, Notes, and future additions) must use
+this wrapper or implement an equivalent structure that fully satisfies this contract.
+
+### Right Rail Stack Order (Canonical)
+
+Top → Bottom:
+
+1. Objective Panel
+2. Strategy Panel
+3. Notes Panel
+
+
 ## 5. Time & Market Semantics (Locked)
 
 - Market session authority: Eastern Time (ET)
 - Display semantics: user-preference overlay
 - Daily candles represent regular trading session only
 - Range and resolution compatibility is enforced silently
+
+### 5.a Strategy Session-Bound Validity (Invariant)
+
+Strategies in TraderPro are inherently session-scoped.
+
+A Strategy is valid only for the trading session it is explicitly ratified for. At the conclusion of that session, the Strategy expires automatically.
+
+- No Strategy carries forward across sessions by default.
+- A new trading session always requires explicit Strategy re-ratification.
+- Session expiration applies regardless of Objective continuity or change.
+
+This invariant exists to preserve disciplined, intentional trading behavior and to prevent cognitive drift across market days.
+
+#### Relationship to Objective Governance
+
+Strategy session expiration is orthogonal to Objective alignment:
+
+- Objective governance determines whether a Strategy is conceptually valid.
+- Session binding determines whether a Strategy is temporally eligible.
+
+A Strategy must satisfy both conditions to be usable:
+1. It is valid relative to the currently ACTIVE Objective.
+2. It is ratified for the current trading session.
+
+Failure of either condition renders the Strategy ineligible.
+
+#### Explicit Non-Implications
+
+This invariant does not imply:
+- Trade execution
+- Automation
+- AI decision-making
+- Order persistence
+- Session-based carryover logic
+
+It establishes governance truth only. Other planes may consume this truth but may not override it.
 
 ---
 

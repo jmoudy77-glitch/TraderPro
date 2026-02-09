@@ -251,6 +251,37 @@ function computeWindowSkewMs(canonStartISO: string | null | undefined, wsStartIS
   return Math.abs(a - b);
 }
 
+function shiftIsoDays(iso: string, days: number): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  return new Date(t + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/**
+ * For 1D windows, if the computed session date lands on a weekend, shift the entire
+ * window back to the most recent weekday (Fri). This ensures market-closed days
+ * still hydrate from the most recent trading session.
+ *
+ * NOTE: This is a minimal weekend guard. Holidays can be layered later if needed.
+ */
+function adjust1DWindowOffWeekend(args: { range: string; startISO: string; endISO: string }) {
+  if (args.range !== "1D") return args;
+
+  const startTs = Date.parse(args.startISO);
+  if (!Number.isFinite(startTs)) return args;
+
+  const d = new Date(startTs);
+  const dow = d.getUTCDay(); // 0=Sun, 6=Sat (safe here because session start is in UTC morning)
+  const backDays = dow === 6 ? 1 : dow === 0 ? 2 : 0;
+  if (backDays === 0) return args;
+
+  return {
+    ...args,
+    startISO: shiftIsoDays(args.startISO, -backDays),
+    endISO: shiftIsoDays(args.endISO, -backDays),
+  };
+}
+
 function extractWsSessionStartISO(wsMeta: any): string | null {
   const v = wsMeta?.window?.session_start_ts;
   return typeof v === "string" && v.length > 0 ? v : null;
@@ -309,11 +340,19 @@ export async function GET(req: NextRequest) {
 
   // Canonical window bounds + expected bar count (session-aware for 1D).
   const windowSession: "regular" | "extended" = session === "extended" ? "extended" : "regular";
-  const computedWindow = computeWindow({
+  let computedWindow = computeWindow({
     range: effectiveRange,
     res: effectiveRes,
     session: windowSession,
   });
+
+  // Weekend guard: for 1D session windows, shift to the most recent trading weekday.
+  const adjusted = adjust1DWindowOffWeekend({
+    range: effectiveRange,
+    startISO: computedWindow.startISO,
+    endISO: computedWindow.endISO,
+  });
+  computedWindow = { ...computedWindow, startISO: adjusted.startISO, endISO: adjusted.endISO };
 
   const expectedBars = computedWindow.expectedBars;
 

@@ -1,12 +1,8 @@
 // src/app/api/scheduler/tick/route.ts
 import { NextResponse } from "next/server";
 import { LOCAL_WATCHLISTS } from "@/lib/watchlists/local-watchlists";
-import { createClient } from "@supabase/supabase-js";
+import { createSupabaseServiceRole } from "@/lib/supabase/server";
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 function normalizeSymbol(s: string) {
   return s.trim().toUpperCase();
@@ -31,6 +27,14 @@ function requireEnv(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`MISSING_ENV:${name}`);
   return v;
+}
+
+function requireSchedulerAuth(req: Request): { ok: true } | { ok: false; error: string } {
+  const expected = process.env.TRADERPRO_SCHEDULER_SECRET || "";
+  if (!expected) return { ok: false, error: "SCHEDULER_SECRET_NOT_CONFIGURED" };
+  const got = req.headers.get("x-traderpro-scheduler-secret") ?? "";
+  if (!got || got !== expected) return { ok: false, error: "UNAUTHORIZED_SCHEDULER" };
+  return { ok: true };
 }
 
 function chunk<T>(arr: T[], size: number): T[][] {
@@ -86,10 +90,10 @@ const ETF_INDEX_CLASSIFICATION: Record<string, { sector: string; industry: strin
   IWM: { sector: "ETF", industry: "Index ETF", industry_code: "INDEX_ETF", industry_abbrev: "IDX-ETF" },
 };
 
-async function hydrateSymbolClassificationEtfStubs(params: {
-  ownerUserId: string;
-  symbols: string[];
-}): Promise<{ hydrated: string[]; skipped: string[] }> {
+async function hydrateSymbolClassificationEtfStubs(
+  supabase: any,
+  params: { ownerUserId: string; symbols: string[] }
+): Promise<{ hydrated: string[]; skipped: string[] }> {
   const hydrated: string[] = [];
   const skipped: string[] = [];
 
@@ -152,7 +156,10 @@ function nyTradeDateFromBarTs(ts: string): string {
   return `${y}-${m}-${d}`;
 }
 
-async function upsertEodRows(rows: Array<{ symbol: string; trade_date: string; close: number }>) {
+async function upsertEodRows(
+  supabase: any,
+  rows: Array<{ symbol: string; trade_date: string; close: number }>
+) {
   if (rows.length === 0) return 0;
   const batches = chunk(rows, 1000);
   let written = 0;
@@ -213,7 +220,11 @@ async function fetchAlpacaBars(params: {
   return { barsBySymbol, nextPageToken: json?.next_page_token ?? null };
 }
 
-async function upsertCandleRows(table: string, rows: any[]) {
+async function upsertCandleRows(
+  supabase: any,
+  table: string,
+  rows: any[]
+) {
   if (rows.length === 0) return 0;
 
   // Keep chunk size conservative for PostgREST payload limits.
@@ -233,14 +244,17 @@ export async function GET(req: Request) {
   const startedAt = new Date();
   const url = new URL(req.url);
 
+  const authz = requireSchedulerAuth(req);
+  if (!authz.ok) {
+    return NextResponse.json({ ok: false, error: authz.error }, { status: 401 });
+  }
+
+  const supabase = createSupabaseServiceRole();
+
   const origin = url.origin;
   const metaDebug = (url.searchParams.get("metaDebug") || "").toLowerCase() === "1";
 
-  const ownerUserId =
-    url.searchParams.get("ownerUserId") ||
-    process.env.NEXT_PUBLIC_DEV_OWNER_USER_ID ||
-    process.env.DEV_OWNER_USER_ID ||
-    "";
+  const ownerUserId = process.env.TRADERPRO_DEV_OWNER_USER_ID || "";
 
   if (!ownerUserId || !isUuid(ownerUserId)) {
     return NextResponse.json(
@@ -343,7 +357,7 @@ export async function GET(req: Request) {
   // Alpaca does not provide sector/industry classification; this keeps ETF/index proxies from staying perpetually "missing".
   if (metaNeedsHydrate.length > 0) {
     try {
-      const r = await hydrateSymbolClassificationEtfStubs({ ownerUserId, symbols: metaNeedsHydrate });
+      const r = await hydrateSymbolClassificationEtfStubs(supabase, { ownerUserId, symbols: metaNeedsHydrate });
       symbolMetaHydratedEtf = r.hydrated;
       symbolMetaSkippedEtf = r.skipped;
 
@@ -445,9 +459,9 @@ export async function GET(req: Request) {
           }
 
           // Write this page immediately to keep memory bounded.
-          totalRows += await upsertCandleRows(tf.table, rows);
+          totalRows += await upsertCandleRows(supabase, tf.table, rows);
           if (tf.key === "1d") {
-            eodWritten += await upsertEodRows(eodRows);
+            eodWritten += await upsertEodRows(supabase, eodRows);
           }
 
           if (!nextPageToken) break;

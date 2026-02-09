@@ -1,30 +1,63 @@
 // /Users/joshmoudy/dev/traderpro/src/app/api/user/preferences/route.ts
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import {
+  createSupabaseServerAnon,
+  createSupabaseServerWithJwt,
+  createSupabaseServiceRole,
+} from "@/lib/supabase/server";
 
-function getEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
+function getBearerToken(req: Request): string | null {
+  const h = req.headers.get("authorization") ?? req.headers.get("Authorization");
+  if (!h) return null;
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m?.[1]?.trim() || null;
 }
 
-function supabaseService() {
-  return createClient(getEnv("SUPABASE_URL"), getEnv("SUPABASE_SERVICE_ROLE_KEY"), {
-    auth: { persistSession: false },
-  });
+function getDevOwnerId() {
+  if (process.env.NODE_ENV !== "development") return null;
+  if (process.env.TRADERPRO_DEV_OWNER_FALLBACK !== "true") return null;
+  return process.env.TRADERPRO_DEV_OWNER_USER_ID || null;
 }
 
-// Until auth is wired, mirror the pattern used elsewhere: drive by DEV owner id.
-function devUserId() {
-  const v = process.env.TRADERPRO_DEV_OWNER_USER_ID;
-  if (!v) throw new Error("Missing env: TRADERPRO_DEV_OWNER_USER_ID");
-  return v;
+async function resolveActor(req: Request) {
+  const jwt = getBearerToken(req);
+
+  if (jwt) {
+    const supabase = createSupabaseServerAnon();
+    const { data: auth, error: authErr } = await supabase.auth.getUser(jwt);
+    if (authErr || !auth?.user) return { ok: false as const };
+
+    const supabaseBound = createSupabaseServerWithJwt(jwt);
+    return {
+      ok: true as const,
+      uid: auth.user.id,
+      supabase: supabaseBound,
+      mode: "authed" as const,
+    };
+  }
+
+  const devOwnerId = getDevOwnerId();
+  if (devOwnerId) {
+    const supabase = createSupabaseServiceRole();
+    return {
+      ok: true as const,
+      uid: devOwnerId,
+      supabase,
+      mode: "dev" as const,
+    };
+  }
+
+  return { ok: false as const };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const userId = devUserId();
-    const supabase = supabaseService();
+    const actor = await resolveActor(req);
+    if (!actor.ok) {
+      return NextResponse.json({ ok: false, error: "UNAUTHENTICATED" }, { status: 401 });
+    }
+    const userId = actor.uid;
+    const supabase = actor.supabase;
 
     const { data, error } = await supabase
       .from("user_preferences")
@@ -50,16 +83,20 @@ export async function GET() {
     });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: e?.message ?? "unknown_error", preferences: { timezone: "America/Chicago" } },
-      { status: 200 }
+      { ok: false, error: e?.message ?? "unknown_error" },
+      { status: 500 }
     );
   }
 }
 
 export async function POST(req: Request) {
   try {
-    const userId = devUserId();
-    const supabase = supabaseService();
+    const actor = await resolveActor(req);
+    if (!actor.ok) {
+      return NextResponse.json({ ok: false, error: "UNAUTHENTICATED" }, { status: 401 });
+    }
+    const userId = actor.uid;
+    const supabase = actor.supabase;
     const body = (await req.json()) as { timezone?: unknown };
 
     const timezone = typeof body.timezone === "string" && body.timezone.trim() ? body.timezone.trim() : null;

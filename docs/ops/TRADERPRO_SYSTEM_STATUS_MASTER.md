@@ -11,9 +11,9 @@
 
 ## 0. Status Header
 
-Last updated: 2026-02-07  
+Last updated: 2026-02-09  
 Overall system posture: TRANSITIONING  
-Primary risk vector: Historical candle routing still stabilizing
+Primary risk vector: Historical candle routing stabilizing (weekend anchoring resolved)
 
 ---
 
@@ -23,7 +23,7 @@ Primary risk vector: Historical candle routing still stabilizing
 |-----|------------------|--------|------|
 | Durable Data Plane | Supabase | STABLE | Scheduler-driven |
 | Intraday Plane | Fly realtime-ws | STABLE | Alpaca WS primary |
-| Cognition Plane | UI + DB | PARTIAL | Notes + Strategy present |
+| Cognition Plane | UI + DB | PARTIAL | Objective + Strategy persistence active in dev (DB-backed, governance-complete); JWT-bound Supabase server clients enforced; dev-only service-role fallback explicitly gated (no login plane yet) |
 | AI Plane | None | INACTIVE | Plane defined, not active |
 | Execution Plane | None | INACTIVE | Engineered-for, gated |
 | UI Plane | Next.js App | STABLE | No provider coupling |
@@ -56,6 +56,8 @@ Alpaca WS → Fly realtime-ws → UI overlay
 | /api/market/candles/after-hours | Legacy | SECONDARY | DEPRECATED |
 
 Rule: If the UI is calling something not listed here, that is a bug.
+
+Note: Scheduler and legacy candle endpoints are internal-only and require scheduler secret authentication. Any UI invocation outside this matrix is a defect.
 
 ---
 
@@ -90,8 +92,9 @@ Symbol universe:
 | Range↔Resolution auto-bump | OK | Silent |
 | Daily tooltip (date only) | OK | Locked |
 | Held charts = holdings only | OK | Enforced |
-| Objective panel present | NOT PRESENT | Planned |
-| Objective → Strategy linkage | NOT PRESENT | Blocked on Objective |
+| Objective panel present | ACTIVE (DEV) | DB-backed (draft/active/closed), single ACTIVE invariant enforced at DB layer; no login plane |
+| Objective → Strategy linkage | ACTIVE (DEV) | Strategy validity governed by ACTIVE Objective + explicit ratification; session-bound and expires at session end (Canon §5.a); STALE on Objective change/closure |
+| Strategy persistence & ratification | ACTIVE (DEV) | DB-backed strategies, versions, events; session-bound ratification; single ACTIVE per user per ET session enforced at DB layer |
 | Analysis Grid persistence | NOT STARTED | Known gap |
 
 ---
@@ -101,14 +104,19 @@ Symbol universe:
 - Migration to single canonical historical candles endpoint in progress  
   Risk: mixed hydration paths if regression introduced  
   Mitigation: network audit + endpoint matrix
+- 1D historical candle windows now anchor to the most recent trading session when markets are closed (weekends), preventing empty hydration for durable ranges
+- Historical candles hydration loop eliminated via idempotent session-state updates in WatchlistsPanel (prevents infinite refetch against /api/market/candles/window under non-market conditions)
 
 ---
 
 ## 8. Known Degradations
 
-- Objective panel not yet implemented
 - AI Plane defined but not active
 - Execution Plane defined but not active
+- Auth-path API routes now bind JWTs to Supabase server clients for PostgREST/RPC calls; dev-only service-role fallback remains available only behind explicit dev flags until login plumbing is implemented
+- Strategy governance is enforced in the Cognition plane (UI + DB), but not yet consumed by Execution or AI planes
+
+- 2026-02-09: Cross-user access paths audited and eliminated; scheduler and legacy routes hardened with internal auth; no unconditional service-role usage remains
 
 ---
 
@@ -131,6 +139,7 @@ shippable system state while minimizing future refactoring.
 - Strategy ratification gates downstream behavior
 - Durable coverage guarantees locked per symbol universe
 - Scheduler diagnostics hardened (counts, gaps, timestamps)
+- Login plumbing implemented, including JWT-bound Supabase server clients for authenticated API routes
 
 ### SHIP (Execution-Ready Substrate)
 

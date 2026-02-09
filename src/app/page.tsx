@@ -4,6 +4,7 @@ import IndustryPostureGrid from "@/components/industry/IndustryPostureGrid";
 import WatchlistsPanel from "@/components/watchlists/WatchlistsPanel";
 import NotesPanel from "@/components/panels/NotesPanel";
 import StrategyPanel from "@/components/panels/StrategyPanel";
+import ObjectivePanelController from "@/components/panels/ObjectivePanelController";
 import { ChartStateProvider } from "@/components/state/ChartStateProvider";
 
 export default function Home() {
@@ -26,10 +27,13 @@ export default function Home() {
 
           <div className="col-span-3 flex min-h-0 flex-col gap-3">
             <div className="min-h-0 flex-1">
-              <NotesPanel />
+              <ObjectivePanelController />
             </div>
             <div className="min-h-0 flex-1">
               <StrategyPanel />
+            </div>
+            <div className="min-h-0 flex-1">
+              <NotesPanel />
             </div>
           </div>
         </div>

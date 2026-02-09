@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createSupabaseServiceRole } from "@/lib/supabase/server";
 
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume?: number };
 
@@ -23,7 +23,7 @@ function toIsoFromEpochSeconds(sec: number): string {
 }
 
 async function persistDurableCandles(args: {
-  supabase: SupabaseClient;
+  supabase: any;
   symbol: string;
   resolution: DurableResolution;
   candles: Candle[];
@@ -173,16 +173,6 @@ function durationSecondsForRange(range: string): number {
   }
 }
 
-function getAdmin() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL");
-  if (!serviceKey) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
-
-  return createClient(url, serviceKey, { auth: { persistSession: false } });
-}
-
 function getAlpacaCreds(): { key: string; secret: string; dataBaseUrl: string; feed?: string } {
   // Support existing env naming in this repo (.env.local): ALPACA_KEY / ALPACA_SECRET
   // Also support common variants used in other deployments.
@@ -257,6 +247,14 @@ async function fetchAlpacaBars(args: {
   }));
 }
 
+function requireSchedulerAuth(req: Request): { ok: true } | { ok: false; error: string } {
+  const expected = process.env.TRADERPRO_SCHEDULER_SECRET || "";
+  if (!expected) return { ok: false, error: "SCHEDULER_SECRET_NOT_CONFIGURED" };
+  const got = req.headers.get("x-traderpro-scheduler-secret") ?? "";
+  if (!got || got !== expected) return { ok: false, error: "UNAUTHORIZED_SCHEDULER" };
+  return { ok: true };
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
 
@@ -300,8 +298,6 @@ export async function GET(req: Request) {
     );
   }
 
-  const supabase = getAdmin();
-
   // Range window: request enough lookback for charting continuity.
   const durationSeconds = durationSecondsForRange(range);
 
@@ -341,16 +337,23 @@ export async function GET(req: Request) {
       candles = resolution === "1h" ? h1 : aggregate4hFrom1hBars(h1);
     }
 
-    // Persist durable bars whenever we successfully fetched.
-    // Scheduler is the canonical caller (shortly after candle close), but ad-hoc calls are allowed.
-    await persistDurableCandles({
-      supabase,
-      symbol: requestSymbol,
-      resolution: resolution as DurableResolution,
-      candles,
-      source: "alpaca",
-      ownerUserId: null,
-    });
+    // Persist durable bars only for authenticated scheduler calls.
+    if (scheduler) {
+      const authz = requireSchedulerAuth(req);
+      if (!authz.ok) {
+        return NextResponse.json({ ok: false, error: authz.error }, { status: 401 });
+      }
+
+      const supabase = createSupabaseServiceRole();
+      await persistDurableCandles({
+        supabase,
+        symbol: requestSymbol,
+        resolution: resolution as DurableResolution,
+        candles,
+        source: "alpaca",
+        ownerUserId: null,
+      });
+    }
 
     return NextResponse.json({
       ok: true,
